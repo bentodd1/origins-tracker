@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "tracker", "runtimeExecutable": "python3", "runtimeArgs": ["tracker.py", "serve", "8787"], "port": 8787 }
+  ]
+}

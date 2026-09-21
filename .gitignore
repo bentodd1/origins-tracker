@@ -1,0 +1,6 @@
+# personal match history and copied replays
+data/
+__pycache__/
+*.pyc
+venv/
+.DS_Store

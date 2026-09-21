@@ -1,0 +1,126 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Origins Tracker</title>
+<style>
+  :root { --bg:#141518; --panel:#1e2024; --line:#2c2f35; --text:#e8e8ea; --muted:#9a9ca3; --win:#3ddc97; --loss:#ff5c6c; --accent:#7aa2ff; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex; gap:24px; align-items:baseline; }
+  header h1 { margin:0; font-size:18px; letter-spacing:.02em; }
+  header .sub { color:var(--muted); }
+  main { padding:20px 24px; display:grid; gap:20px; grid-template-columns: 1fr 1fr; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  section.wide { grid-column: 1 / -1; }
+  h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
+  .tiles { display:flex; gap:14px; flex-wrap:wrap; }
+  .tile { min-width:130px; }
+  .tile .v { font-size:30px; font-weight:600; }
+  .tile .l { color:var(--muted); font-size:12px; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  td.num, th.num { text-align:right; font-variant-numeric: tabular-nums; }
+  .bar { display:inline-block; height:8px; border-radius:4px; background:var(--accent); vertical-align:middle; }
+  .W { color:var(--win); font-weight:600; } .L { color:var(--loss); font-weight:600; }
+  button { background:#2a2d34; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
+  button.w { border-color:var(--win); } button.l { border-color:var(--loss); }
+  button.on.w { background:var(--win); color:#062; } button.on.l { background:var(--loss); color:#400; }
+  .deck { color:var(--muted); font-size:12px; white-space:normal; max-width:420px; }
+  .empty { color:var(--muted); padding:8px 0; }
+  .wrap { overflow-x:auto; }
+</style>
+</head>
+<body>
+<header><h1>Origins Tracker</h1><span class="sub" id="sub">loading…</span></header>
+<main>
+  <section class="wide">
+    <h2>Record</h2>
+    <div class="tiles" id="tiles"></div>
+  </section>
+  <section class="wide">
+    <h2>Matches <span style="font-weight:400;text-transform:none;letter-spacing:0">— click W or L after each game; the replay does not record the winner</span></h2>
+    <div class="wrap"><table id="matches"></table></div>
+  </section>
+  <section>
+    <h2>My cards — win rate when in deck</h2>
+    <div class="wrap"><table id="cards"></table></div>
+  </section>
+  <section>
+    <h2>Opponent cards — how often I lose against them</h2>
+    <div class="wrap"><table id="oppcards"></table></div>
+  </section>
+  <section>
+    <h2>Rank history</h2>
+    <div class="wrap"><table id="rank"></table></div>
+  </section>
+  <section>
+    <h2>By my rank</h2>
+    <div class="wrap"><table id="byrank"></table></div>
+  </section>
+  <section>
+    <h2>By my commander</h2>
+    <div class="wrap"><table id="mycmd"></table></div>
+  </section>
+  <section>
+    <h2>By opponent commander</h2>
+    <div class="wrap"><table id="oppcmd"></table></div>
+  </section>
+</main>
+<script>
+const pct = x => x == null ? '—' : Math.round(x * 100) + '%';
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+async function load() {
+  const s = await (await fetch('/api/stats')).json();
+  document.getElementById('sub').textContent = `${s.total} match${s.total===1?'':'es'} tracked · ${s.unlabeled} waiting for a W/L`;
+  const tiles = [
+    ['Win rate', pct(s.winrate)], ['Record', `${s.wins}-${s.losses}`], ['Tracked', s.total],
+    ['My rank', s.current_rank || '—'],
+  ];
+  if (s.onboarding) tiles.push(['Onboarding bots', `${s.onboarding.wins}-${s.onboarding.losses} (${pct(s.onboarding.wins/(s.onboarding.wins+s.onboarding.losses))})`]);
+  document.getElementById('tiles').innerHTML = tiles.map(([l,v]) => `<div class="tile"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join('');
+
+  const mt = document.getElementById('matches');
+  if (!s.matches.length) mt.innerHTML = '<tr><td class="empty">No matches yet. Play a game with the tracker running.</td></tr>';
+  else mt.innerHTML = '<tr><th>When</th><th>Result</th><th>My rank</th><th>Me</th><th>Opponent</th><th>Their rank</th><th class="num">Rounds</th><th>My deck</th><th>Their deck</th></tr>' +
+    s.matches.map(m => `<tr>
+      <td>${esc(m.played_at)}</td>
+      <td><button class="w ${m.result==='W'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='W'?'':'W'}')">W</button>
+          <button class="l ${m.result==='L'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='L'?'':'L'}')">L</button></td>
+      <td>${esc(m.my_rank)}</td>
+      <td>${esc(m.my_commander_name)}</td>
+      <td>${esc(m.opp_commander_name)} <span class="deck">(${esc(m.opp)})</span></td>
+      <td>${esc(m.opp_rank)}</td><td class="num">${m.rounds}</td>
+      <td class="deck">${m.my_deck_names.map(esc).join(', ')}</td>
+      <td class="deck">${m.opp_deck_names.map(esc).join(', ')}</td></tr>`).join('');
+
+  const rows = (id, list, cols) => {
+    const el = document.getElementById(id);
+    if (!list.length) { el.innerHTML = '<tr><td class="empty">Nothing yet — label a match first.</td></tr>'; return; }
+    el.innerHTML = '<tr>' + cols.map(c => `<th class="${c.num?'num':''}">${c.h}</th>`).join('') + '</tr>' +
+      list.map(r => '<tr>' + cols.map(c => `<td class="${c.num?'num':''}">${c.f(r)}</td>`).join('') + '</tr>').join('');
+  };
+  const rate = r => `<span class="bar" style="width:${Math.round((r)*60)}px"></span> ${pct(r)}`;
+  rows('cards', s.cards, [
+    {h:'Card', f:r=>esc(r.name)}, {h:'Cost', num:true, f:r=>r.cost ?? ''}, {h:'Type', f:r=>esc(r.type||'')},
+    {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
+  rows('oppcards', s.opp_cards, [
+    {h:'Card', f:r=>esc(r.name)}, {h:'Games', num:true, f:r=>r.games}, {h:'Losses', num:true, f:r=>r.losses}, {h:'Loss rate', f:r=>rate(r.lossrate)}]);
+  rows('rank', s.rank_history.slice().reverse(), [
+    {h:'Rank', f:r=>esc(r.rank)}, {h:'Since', f:r=>esc(r.since)}]);
+  rows('byrank', s.by_my_rank, [
+    {h:'Rank', f:r=>esc(r.key)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
+  rows('mycmd', s.by_my_commander, [
+    {h:'Commander', f:r=>esc(r.name)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
+  rows('oppcmd', s.by_opp_commander, [
+    {h:'Commander', f:r=>esc(r.name)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
+}
+async function label(id, result) {
+  await fetch(`/api/label?id=${encodeURIComponent(id)}&result=${result}`, {method:'POST'});
+  load();
+}
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

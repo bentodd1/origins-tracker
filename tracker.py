@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""Origins TCG match tracker.
+
+The game writes exactly one replay file per match to its data dir and
+overwrites it on the next match, so this tool copies every new replay into
+data/replays/, decodes it, and keeps a SQLite history from which it computes
+win rate and per-card stats.
+
+Commands:
+  python3 tracker.py import          # ingest whatever replay is in the game dir right now
+  python3 tracker.py watch           # keep running; ingest each new replay as it appears
+  python3 tracker.py label W|L [id]  # mark the latest (or given) match as a win or loss
+  python3 tracker.py stats           # print win rate and card stats
+  python3 tracker.py serve [port]    # local dashboard (default http://localhost:8787)
+"""
+import errno
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import sys
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from replay_format import parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def find_game_dir():
+    """Unity persistentDataPath for the game. Override with ORIGINS_GAME_DIR."""
+    env = os.environ.get("ORIGINS_GAME_DIR")
+    if env:
+        return env
+    if sys.platform == "darwin":
+        candidates = [os.path.expanduser("~/Library/Application Support/io.koingames.originstcg.game")]
+    elif sys.platform.startswith("win"):
+        low = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "AppData", "LocalLow", "Koin Games")
+        candidates = [os.path.join(low, n) for n in ("Origins TCG Demo", "Origins TCG Playtest", "Origins TCG")]
+    else:
+        candidates = [os.path.expanduser("~/.config/unity3d/Koin Games/Origins TCG Demo")]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    return candidates[0]
+
+
+GAME_DIR = find_game_dir()
+DATA_DIR = os.path.join(HERE, "data")
+REPLAY_DIR = os.path.join(DATA_DIR, "replays")
+DB_PATH = os.path.join(DATA_DIR, "tracker.db")
+
+# Event/field ids observed in build 0.6.3 replays. See replay_format.py for the grammar.
+EV_DRAW = 20        # card enters hand: 50 = card instance id
+EV_DRAG = 40        # drag in progress/drop: 50 = {1: instance id}, 51 lane, 53 slot, 54 dropped
+EV_UNDO = 41        # placement picked back up
+EV_READY = 50       # player clicked ready
+EV_PHASE = 51       # phase advanced (player 255 = system)
+EV_EMOTE = 60       # 50 = emote key
+COMMIT_PLACE = 3    # committed placement in the round summary: 50 instance id, 51 lane, 53 slot
+
+
+# ----------------------------------------------------------------------------- card db
+def load_card_db():
+    """Card definitions the client downloaded (playtest and demo buckets)."""
+    cards, locations = {}, {}
+    for f in glob.glob(os.path.join(GAME_DIR, "Data", "*", "*", "current", "CardBaseData", "GameData_CardBase_Data_*.json")):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        cards.setdefault(d["Key"], {k: d.get(k) for k in ("Name", "Type", "Rarity", "SubType", "ManaCost", "Power", "Health")})
+    for f in glob.glob(os.path.join(GAME_DIR, "Data", "*", "*", "current", "LocationData", "GameData_Locations_Data_*.json")):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        locations.setdefault(d["Key"], d.get("Name"))
+    if not cards:  # fall back to the snapshot committed next to this script
+        snap = os.path.join(HERE, "carddb_snapshot.json")
+        if os.path.exists(snap):
+            s = json.load(open(snap))
+            cards, locations = s["cards"], {k: v.get("Name") for k, v in s["locations"].items()}
+    return cards, locations
+
+
+def base_key(variant_key):
+    return variant_key.split("_V")[0]
+
+
+# ----------------------------------------------------------------------------- decoding
+def decode_replay(path):
+    raw = open(path, "rb").read()
+    d = parse(raw)
+    m = re.match(r"LatestMatch_(.+)_vs_(.+)_(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})\.replay$", os.path.basename(path))
+    me_name, opp_name, stamp = (m.group(1), m.group(2), m.group(3)) if m else (None, None, None)
+    played_at = datetime.strptime(stamp, "%Y-%m-%d_%H-%M-%S").isoformat(sep=" ") if stamp else None
+
+    players = []
+    for idx, p in enumerate(d[3]):
+        deck = [c[0] for c in p[5][0] if not c[0].startswith("Tower")]
+        players.append({
+            "index": idx,
+            "beamable_id": p[0],
+            "name": p[1],
+            "flag2": p.get(2),
+            "flag4": p.get(4),
+            "rank": p.get(7),
+            "avatar": p.get(8),
+            "commander": p.get(11),
+            "deck": deck,
+        })
+    me = next((p for p in players if p["name"] == me_name), players[0])
+    opp = next((p for p in players if p is not me), None)
+
+    rounds = d[4]
+    placements = []   # (round, player, instance id, lane, slot)
+    for ri, r in enumerate(rounds):
+        for e in r.get(0, []):
+            if e.get(0) == COMMIT_PLACE:
+                placements.append((ri, e.get(2), e.get(50), e.get(51), e.get(53)))
+    conf = d[2]
+    return {
+        "file": os.path.basename(path),
+        "played_at": played_at,
+        "me": me, "opp": opp,
+        "arena": conf.get(0), "seed": conf.get(1), "location_pool": conf.get(37),
+        "header_flag": d.get(1),           # candidate result field, unverified
+        "rounds": len(rounds),
+        "placements": placements,
+        "size": len(raw),
+    }
+
+
+# ----------------------------------------------------------------------------- storage
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS matches (
+  id TEXT PRIMARY KEY, played_at TEXT, me TEXT, opp TEXT,
+  my_commander TEXT, opp_commander TEXT, my_rank TEXT, opp_rank TEXT,
+  my_deck TEXT, opp_deck TEXT, arena TEXT, seed INTEGER, location_pool TEXT,
+  rounds INTEGER, header_flag INTEGER, my_flag2 INTEGER, my_flag4 INTEGER,
+  opp_flag2 INTEGER, opp_flag4 INTEGER, result TEXT, imported_at TEXT
+);
+CREATE TABLE IF NOT EXISTS placements (
+  match_id TEXT, round INTEGER, player INTEGER, instance_id INTEGER, lane INTEGER, slot INTEGER
+);
+"""
+
+
+def db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    c = sqlite3.connect(DB_PATH)
+    c.row_factory = sqlite3.Row
+    c.executescript(SCHEMA)
+    return c
+
+
+def ingest(path, conn=None):
+    conn = conn or db()
+    rec = decode_replay(path)
+    if conn.execute("SELECT 1 FROM matches WHERE id=?", (rec["file"],)).fetchone():
+        return None
+    os.makedirs(REPLAY_DIR, exist_ok=True)
+    dst = os.path.join(REPLAY_DIR, rec["file"])
+    if not os.path.exists(dst):
+        shutil.copy2(path, dst)
+    me, opp = rec["me"], rec["opp"] or {}
+    conn.execute(
+        "INSERT INTO matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rec["file"], rec["played_at"], me["name"], opp.get("name"),
+         me["commander"], opp.get("commander"), me["rank"], opp.get("rank"),
+         json.dumps(me["deck"]), json.dumps(opp.get("deck", [])), rec["arena"], rec["seed"], rec["location_pool"],
+         rec["rounds"], rec["header_flag"], me["flag2"], me["flag4"], opp.get("flag2"), opp.get("flag4"),
+         None, datetime.now().isoformat(sep=" ")))
+    conn.executemany("INSERT INTO placements VALUES (?,?,?,?,?,?)",
+                     [(rec["file"], *p) for p in rec["placements"]])
+    conn.commit()
+    return rec
+
+
+def game_replays():
+    return sorted(glob.glob(os.path.join(GAME_DIR, "LatestMatch_*.replay")))
+
+
+def cmd_import():
+    conn = db()
+    n = 0
+    for p in game_replays() + sorted(glob.glob(os.path.join(REPLAY_DIR, "*.replay"))):
+        if ingest(p, conn):
+            n += 1
+            print("imported", os.path.basename(p))
+    print(f"{n} new match(es)")
+
+
+def cmd_watch(interval=2.0):
+    conn = db()
+    seen = set(os.path.basename(p) for p in game_replays())
+    for p in game_replays():
+        ingest(p, conn)
+    print(f"watching {GAME_DIR} (ctrl-c to stop)")
+    while True:
+        for p in game_replays():
+            name = os.path.basename(p)
+            if name in seen:
+                continue
+            time.sleep(1.0)  # let the game finish writing
+            rec = ingest(p, conn)
+            seen.add(name)
+            if rec:
+                print(f"[{datetime.now():%H:%M:%S}] new match: {rec['me']['name']} vs {rec['opp']['name']} "
+                      f"({rec['rounds']} rounds). Mark it: python3 tracker.py label W|L")
+        time.sleep(interval)
+
+
+def cmd_label(result, match_id=None):
+    result = result.upper()[0]
+    if result not in "WL":
+        sys.exit("result must be W or L")
+    conn = db()
+    if not match_id:
+        row = conn.execute("SELECT id FROM matches WHERE result IS NULL ORDER BY played_at DESC LIMIT 1").fetchone()
+        if not row:
+            sys.exit("no unlabeled match")
+        match_id = row["id"]
+    conn.execute("UPDATE matches SET result=? WHERE id=?", (result, match_id))
+    conn.commit()
+    print(f"{match_id}: {result}")
+
+
+# ----------------------------------------------------------------------------- stats
+def onboarding_record():
+    """W/L string the client caches from Beamable for the onboarding bot matches."""
+    for f in glob.glob(os.path.join(GAME_DIR, "beamable", "cache", "*", "*", "*", "*.json")):
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        for r in d.get("results", []) if isinstance(d, dict) else []:
+            for s in r.get("stats", []):
+                if s.get("k") == "onboardingResults":
+                    v = s["v"]
+                    return {"wins": v.count("W"), "losses": v.count("L"), "sequence": v}
+    return None
+
+
+def compute_stats(conn):
+    cards, _ = load_card_db()
+    rows = conn.execute("SELECT * FROM matches ORDER BY played_at").fetchall()
+    labeled = [r for r in rows if r["result"]]
+    wins = sum(1 for r in labeled if r["result"] == "W")
+
+    def name(key):
+        c = cards.get(base_key(key or ""))
+        return c["Name"] if c else key
+
+    def group(keyfn):
+        out = {}
+        for r in labeled:
+            k = keyfn(r)
+            g = out.setdefault(k, {"games": 0, "wins": 0})
+            g["games"] += 1
+            g["wins"] += r["result"] == "W"
+        return sorted(({"key": k, **v, "winrate": v["wins"] / v["games"]} for k, v in out.items()),
+                      key=lambda g: (-g["games"], -g["winrate"]))
+
+    card_stats = {}
+    for r in labeled:
+        for key in set(json.loads(r["my_deck"])):
+            g = card_stats.setdefault(key, {"games": 0, "wins": 0})
+            g["games"] += 1
+            g["wins"] += r["result"] == "W"
+    card_rows = []
+    for key, g in card_stats.items():
+        c = cards.get(base_key(key), {})
+        card_rows.append({"key": key, "name": c.get("Name", key), "cost": c.get("ManaCost"), "type": c.get("Type"),
+                          "rarity": c.get("Rarity"), **g, "winrate": g["wins"] / g["games"]})
+    card_rows.sort(key=lambda c: (-c["games"], -c["winrate"], c["name"]))
+
+    opp_card_stats = {}
+    for r in labeled:
+        for key in set(json.loads(r["opp_deck"])):
+            g = opp_card_stats.setdefault(key, {"games": 0, "losses": 0})
+            g["games"] += 1
+            g["losses"] += r["result"] == "L"
+    opp_rows = sorted(({"key": k, "name": name(k), **g, "lossrate": g["losses"] / g["games"]}
+                       for k, g in opp_card_stats.items()), key=lambda c: (-c["games"], -c["lossrate"]))
+
+    # rank as recorded in each replay; a new entry each time it changes
+    rank_history = []
+    for r in rows:
+        if r["my_rank"] and (not rank_history or rank_history[-1]["rank"] != r["my_rank"]):
+            rank_history.append({"rank": r["my_rank"], "since": r["played_at"]})
+    current_rank = rows[-1]["my_rank"] if rows else None
+
+    return {
+        "total": len(rows), "labeled": len(labeled), "unlabeled": len(rows) - len(labeled),
+        "current_rank": current_rank, "rank_history": rank_history,
+        "by_my_rank": group(lambda r: r["my_rank"]),
+        "wins": wins, "losses": len(labeled) - wins,
+        "winrate": (wins / len(labeled)) if labeled else None,
+        "by_my_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["my_commander"])],
+        "by_opp_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["opp_commander"])],
+        "by_opp_rank": group(lambda r: r["opp_rank"]),
+        "cards": card_rows,
+        "opp_cards": opp_rows,
+        "onboarding": onboarding_record(),
+        "matches": [{**dict(r), "my_commander_name": name(r["my_commander"]), "opp_commander_name": name(r["opp_commander"]),
+                     "my_deck_names": [name(k) for k in json.loads(r["my_deck"])],
+                     "opp_deck_names": [name(k) for k in json.loads(r["opp_deck"])]} for r in reversed(rows)],
+    }
+
+
+def cmd_stats():
+    s = compute_stats(db())
+    print(f"matches: {s['total']} ({s['labeled']} labeled, {s['unlabeled']} need a W/L)")
+    if s["winrate"] is not None:
+        print(f"record: {s['wins']}-{s['losses']}  win rate {s['winrate']:.0%}")
+    if s["current_rank"]:
+        print(f"rank: {s['current_rank']}  (" +
+              ", ".join(f"{h['rank']} from {h['since'][:10]}" for h in s["rank_history"]) + ")")
+    if s["onboarding"]:
+        o = s["onboarding"]
+        print(f"onboarding bot matches (from game cache): {o['wins']}-{o['losses']} "
+              f"({o['wins'] / (o['wins'] + o['losses']):.0%})")
+    if s["by_my_commander"]:
+        print("\nby my commander")
+        for g in s["by_my_commander"]:
+            print(f"  {g['name']:<24} {g['wins']}-{g['games'] - g['wins']}  {g['winrate']:.0%}")
+    if s["cards"]:
+        print("\nmy cards (win rate when in deck)")
+        for c in s["cards"]:
+            print(f"  {c['name']:<28} {c['games']:>3} games  {c['winrate']:.0%}")
+    if s["matches"]:
+        print("\nrecent matches")
+        for m in s["matches"][:15]:
+            print(f"  {m['played_at']}  {m['result'] or '?'}  [{m['my_rank']}] {m['my_commander_name']} vs "
+                  f"{m['opp_commander_name']} ({m['opp']}, {m['opp_rank']})  {m['rounds']} rounds")
+
+
+# ----------------------------------------------------------------------------- dashboard
+def dashboard_html():
+    return open(os.path.join(HERE, "dashboard.html")).read()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, body, ctype="application/json"):
+        data = body if isinstance(body, bytes) else body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/":
+            return self._send(200, dashboard_html(), "text/html")
+        if u.path == "/api/stats":
+            conn = db()
+            for p in game_replays():
+                ingest(p, conn)
+            return self._send(200, json.dumps(compute_stats(conn), default=str))
+        self._send(404, "{}")
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        if u.path == "/api/label":
+            q = parse_qs(u.query)
+            mid, res = q.get("id", [None])[0], q.get("result", [None])[0]
+            conn = db()
+            conn.execute("UPDATE matches SET result=? WHERE id=?", (res if res in ("W", "L") else None, mid))
+            conn.commit()
+            return self._send(200, "{}")
+        self._send(404, "{}")
+
+
+def cmd_serve(port=8787):
+    for p in game_replays():
+        ingest(p)
+    try:
+        server = HTTPServer(("127.0.0.1", port), Handler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            sys.exit(f"port {port} is already in use — is another tracker running? "
+                     f"Try: python3 tracker.py serve {port + 1}")
+        raise
+    print(f"dashboard: http://localhost:{port}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    cmd = args[0] if args else "stats"
+    if cmd == "import":
+        cmd_import()
+    elif cmd == "watch":
+        cmd_watch()
+    elif cmd == "label":
+        cmd_label(args[1], args[2] if len(args) > 2 else None)
+    elif cmd == "stats":
+        cmd_stats()
+    elif cmd == "serve":
+        cmd_serve(int(args[1]) if len(args) > 1 else 8787)
+    else:
+        print(__doc__)
