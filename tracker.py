@@ -154,6 +154,10 @@ def decode_replay(path):
         for e in r.get(0, []):
             if e.get(0) == COMMIT_PLACE:
                 placements.append((ri, e.get(2), e.get(50), e.get(51), e.get(53)))
+    # Mouse-cursor samples per player. A bot has no mouse, so zero samples over a
+    # whole match marks the opponent as a bot.
+    for p in players:
+        p["cursor_points"] = sum(len(e.get(1, [])) for r in rounds for e in r.get(2, []) if e.get(0) == p["index"])
     conf = d[2]
     return {
         "file": os.path.basename(path),
@@ -189,33 +193,38 @@ def db():
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
     cols = {r["name"] for r in c.execute("PRAGMA table_info(matches)")}
-    if "build" not in cols:
-        c.execute("ALTER TABLE matches ADD COLUMN build TEXT")
+    for col, typ in (("build", "TEXT"), ("my_cursor_points", "INTEGER"), ("opp_cursor_points", "INTEGER")):
+        if col not in cols:
+            c.execute(f"ALTER TABLE matches ADD COLUMN {col} {typ}")
     return c
 
 
 def ingest(path, conn=None):
     conn = conn or db()
     rec = decode_replay(path)
+    me, opp = rec["me"], rec["opp"] or {}
     if conn.execute("SELECT 1 FROM matches WHERE id=?", (rec["file"],)).fetchone():
-        if rec["build"]:  # backfill for rows imported before builds were tracked
+        # backfill columns added after this row was imported
+        if rec["build"]:
             conn.execute("UPDATE matches SET build=? WHERE id=? AND build IS NULL", (rec["build"], rec["file"]))
-            conn.commit()
+        conn.execute("UPDATE matches SET my_cursor_points=?, opp_cursor_points=? WHERE id=? AND opp_cursor_points IS NULL",
+                     (me["cursor_points"], opp.get("cursor_points"), rec["file"]))
+        conn.commit()
         return None
     os.makedirs(REPLAY_DIR, exist_ok=True)
     dst = os.path.join(REPLAY_DIR, rec["file"])
     if not os.path.exists(dst):
         shutil.copy2(path, dst)
-    me, opp = rec["me"], rec["opp"] or {}
     conn.execute(
         "INSERT INTO matches (id, played_at, me, opp, my_commander, opp_commander, my_rank, opp_rank, my_deck, opp_deck, "
-        "arena, seed, location_pool, rounds, header_flag, my_flag2, my_flag4, opp_flag2, opp_flag4, result, imported_at, build) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "arena, seed, location_pool, rounds, header_flag, my_flag2, my_flag4, opp_flag2, opp_flag4, result, imported_at, build, "
+        "my_cursor_points, opp_cursor_points) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rec["file"], rec["played_at"], me["name"], opp.get("name"),
          me["commander"], opp.get("commander"), me["rank"], opp.get("rank"),
          json.dumps(me["deck"]), json.dumps(opp.get("deck", [])), rec["arena"], rec["seed"], rec["location_pool"],
          rec["rounds"], rec["header_flag"], me["flag2"], me["flag4"], opp.get("flag2"), opp.get("flag4"),
-         None, datetime.now().isoformat(sep=" "), rec["build"]))
+         None, datetime.now().isoformat(sep=" "), rec["build"], me["cursor_points"], opp.get("cursor_points")))
     conn.executemany("INSERT INTO placements VALUES (?,?,?,?,?,?)",
                      [(rec["file"], *p) for p in rec["placements"]])
     conn.commit()
@@ -333,6 +342,10 @@ def compute_stats(conn, build=None):
     opp_rows = sorted(({"key": k, "name": name(k), **g, "lossrate": g["losses"] / g["games"]}
                        for k, g in opp_card_stats.items()), key=lambda c: (-c["games"], -c["lossrate"]))
 
+    def opp_type(r):
+        n = r["opp_cursor_points"]
+        return "?" if n is None else ("Bot" if n == 0 else "Human")
+
     # rank as recorded in each replay, tracked per build since each build has its
     # own ladder; a new entry each time it changes
     rank_history, last_by_build = [], {}
@@ -357,10 +370,12 @@ def compute_stats(conn, build=None):
         "by_my_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["my_commander"])],
         "by_opp_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["opp_commander"])],
         "by_opp_rank": group(lambda r: r["opp_rank"]),
+        "by_opp_type": group(opp_type),
         "cards": card_rows,
         "opp_cards": opp_rows,
         "onboarding": onboarding_record(),
-        "matches": [{**dict(r), "my_commander_name": name(r["my_commander"]), "opp_commander_name": name(r["opp_commander"]),
+        "matches": [{**dict(r), "opp_type": opp_type(r),
+                     "my_commander_name": name(r["my_commander"]), "opp_commander_name": name(r["opp_commander"]),
                      "my_deck_names": [name(k) for k in json.loads(r["my_deck"])],
                      "opp_deck_names": [name(k) for k in json.loads(r["opp_deck"])]} for r in reversed(rows)],
     }
@@ -391,7 +406,7 @@ def cmd_stats(build=None):
         print("\nrecent matches")
         for m in s["matches"][:15]:
             print(f"  {m['played_at']}  {m['result'] or '?'}  [{m['build'] or '?'} {m['my_rank']}] {m['my_commander_name']} vs "
-                  f"{m['opp_commander_name']} ({m['opp']}, {m['opp_rank']})  {m['rounds']} rounds")
+                  f"{m['opp_commander_name']} ({m['opp']}, {m['opp_rank']}, {m['opp_type'].lower()})  {m['rounds']} rounds")
 
 
 # ----------------------------------------------------------------------------- dashboard
@@ -446,7 +461,10 @@ def cmd_serve(port=8787):
                      f"Try: python3 tracker.py serve {port + 1}")
         raise
     print(f"dashboard: http://localhost:{port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
 
 
 if __name__ == "__main__":

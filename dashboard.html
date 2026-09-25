@@ -62,6 +62,10 @@
     <div class="wrap"><table id="bybuild"></table></div>
   </section>
   <section>
+    <h2>Humans vs bots</h2>
+    <div class="wrap"><table id="opptype"></table></div>
+  </section>
+  <section>
     <h2>By my rank</h2>
     <div class="wrap"><table id="byrank"></table></div>
   </section>
@@ -101,7 +105,7 @@ async function load() {
 
   const mt = document.getElementById('matches');
   if (!s.matches.length) mt.innerHTML = `<tr><td class="empty">No ${build==='all'?'':esc(build)+' '}matches yet. Play a game with the tracker running.</td></tr>`;
-  else mt.innerHTML = '<tr><th>When</th><th>Result</th><th>Build</th><th>My rank</th><th>Me</th><th>Opponent</th><th>Their rank</th><th class="num">Rounds</th><th>My deck</th><th>Their deck</th></tr>' +
+  else mt.innerHTML = '<tr><th>When</th><th>Result</th><th>Build</th><th>My rank</th><th>Me</th><th>Opponent</th><th>Their rank</th><th>Bot?</th><th class="num">Rounds</th><th>My deck</th><th>Their deck</th></tr>' +
     s.matches.map(m => `<tr>
       <td>${esc(m.played_at)}</td>
       <td><button class="w ${m.result==='W'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='W'?'':'W'}')">W</button>
@@ -110,7 +114,7 @@ async function load() {
       <td>${esc(m.my_rank)}</td>
       <td>${esc(m.my_commander_name)}</td>
       <td>${esc(m.opp_commander_name)} <span class="deck">(${esc(m.opp)})</span></td>
-      <td>${esc(m.opp_rank)}</td><td class="num">${m.rounds}</td>
+      <td>${esc(m.opp_rank)}</td><td>${esc(m.opp_type)}</td><td class="num">${m.rounds}</td>
       <td class="deck">${m.my_deck_names.map(esc).join(', ')}</td>
       <td class="deck">${m.opp_deck_names.map(esc).join(', ')}</td></tr>`).join('');
 
@@ -131,6 +135,8 @@ async function load() {
   document.getElementById('bybuild-section').hidden = build !== 'all';
   rows('bybuild', s.by_build, [
     {h:'Build', f:r=>esc(r.key)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
+  rows('opptype', s.by_opp_type, [
+    {h:'Opponent', f:r=>esc(r.key)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
   rows('byrank', s.by_my_rank, [
     {h:'Rank', f:r=>esc(r.key)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
   rows('mycmd', s.by_my_commander, [
