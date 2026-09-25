@@ -6,9 +6,9 @@
 <style>
   :root { --bg:#141518; --panel:#1e2024; --line:#2c2f35; --text:#e8e8ea; --muted:#9a9ca3; --win:#3ddc97; --loss:#ff5c6c; --accent:#7aa2ff; }
   body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
-  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex; gap:24px; align-items:baseline; }
-  header h1 { margin:0; font-size:18px; letter-spacing:.02em; }
-  header .sub { color:var(--muted); }
+  header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:10px 24px; align-items:center; }
+  header h1 { margin:0; font-size:18px; letter-spacing:.02em; white-space:nowrap; }
+  header .sub { color:var(--muted); white-space:nowrap; }
   main { padding:20px 24px; display:grid; gap:20px; grid-template-columns: 1fr 1fr; }
   section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
   section.wide { grid-column: 1 / -1; }
@@ -26,13 +26,16 @@
   button { background:#2a2d34; color:var(--text); border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
   button.w { border-color:var(--win); } button.l { border-color:var(--loss); }
   button.on.w { background:var(--win); color:#062; } button.on.l { background:var(--loss); color:#400; }
+  .tabs { margin-left:auto; display:flex; gap:6px; }
+  .tabs button { padding:5px 14px; border-radius:999px; }
+  .tabs button.on { background:var(--accent); color:#0b1430; border-color:var(--accent); }
   .deck { color:var(--muted); font-size:12px; white-space:normal; max-width:420px; }
   .empty { color:var(--muted); padding:8px 0; }
   .wrap { overflow-x:auto; }
 </style>
 </head>
 <body>
-<header><h1>Origins Tracker</h1><span class="sub" id="sub">loading…</span></header>
+<header><h1>Origins Tracker</h1><span class="sub" id="sub">loading…</span><nav class="tabs" id="tabs"></nav></header>
 <main>
   <section class="wide">
     <h2>Record</h2>
@@ -54,8 +57,8 @@
     <h2>Rank history</h2>
     <div class="wrap"><table id="rank"></table></div>
   </section>
-  <section>
-    <h2>By build (demo / playtest)</h2>
+  <section id="bybuild-section">
+    <h2>By build</h2>
     <div class="wrap"><table id="bybuild"></table></div>
   </section>
   <section>
@@ -74,8 +77,20 @@
 <script>
 const pct = x => x == null ? '—' : Math.round(x * 100) + '%';
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// Build filter: 'all' or a build name. Defaults to the build of the most recent match.
+let build = null;
+try { build = localStorage.getItem('origins.build'); } catch (e) {}
+function setBuild(b) {
+  build = b;
+  try { localStorage.setItem('origins.build', b); } catch (e) {}
+  load();
+}
 async function load() {
-  const s = await (await fetch('/api/stats')).json();
+  const q = build && build !== 'all' ? `?build=${encodeURIComponent(build)}` : '';
+  const s = await (await fetch('/api/stats' + q)).json();
+  if (!build) { build = s.latest_build || 'all'; if (build !== 'all') return load(); }
+  document.getElementById('tabs').innerHTML = ['all', ...s.builds].map(b =>
+    `<button class="${b===build?'on':''}" onclick="setBuild('${esc(b)}')">${b==='all'?'All builds':esc(b)}</button>`).join('');
   document.getElementById('sub').textContent = `${s.total} match${s.total===1?'':'es'} tracked · ${s.unlabeled} waiting for a W/L`;
   const tiles = [
     ['Win rate', pct(s.winrate)], ['Record', `${s.wins}-${s.losses}`], ['Tracked', s.total],
@@ -85,7 +100,7 @@ async function load() {
   document.getElementById('tiles').innerHTML = tiles.map(([l,v]) => `<div class="tile"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join('');
 
   const mt = document.getElementById('matches');
-  if (!s.matches.length) mt.innerHTML = '<tr><td class="empty">No matches yet. Play a game with the tracker running.</td></tr>';
+  if (!s.matches.length) mt.innerHTML = `<tr><td class="empty">No ${build==='all'?'':esc(build)+' '}matches yet. Play a game with the tracker running.</td></tr>`;
   else mt.innerHTML = '<tr><th>When</th><th>Result</th><th>Build</th><th>My rank</th><th>Me</th><th>Opponent</th><th>Their rank</th><th class="num">Rounds</th><th>My deck</th><th>Their deck</th></tr>' +
     s.matches.map(m => `<tr>
       <td>${esc(m.played_at)}</td>
@@ -113,6 +128,7 @@ async function load() {
     {h:'Card', f:r=>esc(r.name)}, {h:'Games', num:true, f:r=>r.games}, {h:'Losses', num:true, f:r=>r.losses}, {h:'Loss rate', f:r=>rate(r.lossrate)}]);
   rows('rank', s.rank_history.slice().reverse(), [
     {h:'Build', f:r=>esc(r.build)}, {h:'Rank', f:r=>esc(r.rank)}, {h:'Since', f:r=>esc(r.since)}]);
+  document.getElementById('bybuild-section').hidden = build !== 'all';
   rows('bybuild', s.by_build, [
     {h:'Build', f:r=>esc(r.key)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
   rows('byrank', s.by_my_rank, [

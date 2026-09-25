@@ -10,7 +10,7 @@ Commands:
   python3 tracker.py import          # ingest whatever replay is in the game dir right now
   python3 tracker.py watch           # keep running; ingest each new replay as it appears
   python3 tracker.py label W|L [id]  # mark the latest (or given) match as a win or loss
-  python3 tracker.py stats           # print win rate and card stats
+  python3 tracker.py stats [build]   # print win rate and card stats (optionally for Demo / Playtest only)
   python3 tracker.py serve [port]    # local dashboard (default http://localhost:8787)
 """
 import errno
@@ -287,9 +287,13 @@ def onboarding_record():
     return None
 
 
-def compute_stats(conn):
+def compute_stats(conn, build=None):
+    """Stats for all matches, or only those from one build (Demo / Playtest / ...)."""
     cards, _ = load_card_db()
-    rows = conn.execute("SELECT * FROM matches ORDER BY played_at").fetchall()
+    all_rows = conn.execute("SELECT * FROM matches ORDER BY played_at").fetchall()
+    builds = sorted({r["build"] or "?" for r in all_rows})
+    latest_build = (all_rows[-1]["build"] or "?") if all_rows else None
+    rows = [r for r in all_rows if not build or (r["build"] or "?") == build]
     labeled = [r for r in rows if r["result"]]
     wins = sum(1 for r in labeled if r["result"] == "W")
 
@@ -337,9 +341,13 @@ def compute_stats(conn):
         if r["my_rank"] and last_by_build.get(b) != r["my_rank"]:
             rank_history.append({"build": b, "rank": r["my_rank"], "since": r["played_at"]})
             last_by_build[b] = r["my_rank"]
-    current_rank = ", ".join(f"{rk} ({b})" for b, rk in last_by_build.items()) or None
+    if build:
+        current_rank = last_by_build.get(build)
+    else:
+        current_rank = ", ".join(f"{rk} ({b})" for b, rk in last_by_build.items()) or None
 
     return {
+        "build": build, "builds": builds, "latest_build": latest_build,
         "total": len(rows), "labeled": len(labeled), "unlabeled": len(rows) - len(labeled),
         "current_rank": current_rank, "rank_history": rank_history,
         "by_my_rank": group(lambda r: f"{r['my_rank']} ({r['build'] or '?'})"),
@@ -358,9 +366,10 @@ def compute_stats(conn):
     }
 
 
-def cmd_stats():
-    s = compute_stats(db())
-    print(f"matches: {s['total']} ({s['labeled']} labeled, {s['unlabeled']} need a W/L)")
+def cmd_stats(build=None):
+    s = compute_stats(db(), build)
+    scope = f" [{build}]" if build else ""
+    print(f"matches{scope}: {s['total']} ({s['labeled']} labeled, {s['unlabeled']} need a W/L)")
     if s["winrate"] is not None:
         print(f"record: {s['wins']}-{s['losses']}  win rate {s['winrate']:.0%}")
     if s["current_rank"]:
@@ -410,7 +419,8 @@ class Handler(BaseHTTPRequestHandler):
             conn = db()
             for p in game_replays():
                 ingest(p, conn)
-            return self._send(200, json.dumps(compute_stats(conn), default=str))
+            build = parse_qs(u.query).get("build", [None])[0] or None
+            return self._send(200, json.dumps(compute_stats(conn, build), default=str))
         self._send(404, "{}")
 
     def do_POST(self):
@@ -449,7 +459,7 @@ if __name__ == "__main__":
     elif cmd == "label":
         cmd_label(args[1], args[2] if len(args) > 2 else None)
     elif cmd == "stats":
-        cmd_stats()
+        cmd_stats(args[1] if len(args) > 1 else None)
     elif cmd == "serve":
         cmd_serve(int(args[1]) if len(args) > 1 else 8787)
     else:
