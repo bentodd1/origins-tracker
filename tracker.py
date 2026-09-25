@@ -31,25 +31,31 @@ from replay_format import parse
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def find_game_dir():
-    """Unity persistentDataPath for the game. Override with ORIGINS_GAME_DIR."""
+def find_game_dirs():
+    """Unity persistentDataPath folders for the game, one per installed build.
+
+    On macOS every build (demo, playtest, release) shares one folder keyed on the
+    bundle id. On Windows each build gets its own LocalLow folder keyed on the
+    product name, so all that exist are watched. Override with ORIGINS_GAME_DIR
+    (one path, or several separated by the OS path separator).
+    """
     env = os.environ.get("ORIGINS_GAME_DIR")
     if env:
-        return env
+        return env.split(os.pathsep)
     if sys.platform == "darwin":
         candidates = [os.path.expanduser("~/Library/Application Support/io.koingames.originstcg.game")]
     elif sys.platform.startswith("win"):
         low = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "AppData", "LocalLow", "Koin Games")
         candidates = [os.path.join(low, n) for n in ("Origins TCG Demo", "Origins TCG Playtest", "Origins TCG")]
     else:
-        candidates = [os.path.expanduser("~/.config/unity3d/Koin Games/Origins TCG Demo")]
-    for c in candidates:
-        if os.path.isdir(c):
-            return c
-    return candidates[0]
+        base = os.path.expanduser("~/.config/unity3d/Koin Games")
+        candidates = [os.path.join(base, n) for n in ("Origins TCG Demo", "Origins TCG Playtest", "Origins TCG")]
+    found = [c for c in candidates if os.path.isdir(c)]
+    return found or candidates[:1]
 
 
-GAME_DIR = find_game_dir()
+GAME_DIRS = find_game_dirs()
+GAME_DIR = GAME_DIRS[0]  # kept for messages; every lookup below scans GAME_DIRS
 DATA_DIR = os.path.join(HERE, "data")
 REPLAY_DIR = os.path.join(DATA_DIR, "replays")
 DB_PATH = os.path.join(DATA_DIR, "tracker.db")
@@ -68,13 +74,16 @@ COMMIT_PLACE = 3    # committed placement in the round summary: 50 instance id, 
 def load_card_db():
     """Card definitions the client downloaded (playtest and demo buckets)."""
     cards, locations = {}, {}
-    for f in glob.glob(os.path.join(GAME_DIR, "Data", "*", "*", "current", "CardBaseData", "GameData_CardBase_Data_*.json")):
+    def each(*parts):
+        for g in GAME_DIRS:
+            yield from glob.glob(os.path.join(g, *parts))
+    for f in each("Data", "*", "*", "current", "CardBaseData", "GameData_CardBase_Data_*.json"):
         try:
             d = json.load(open(f))
         except Exception:
             continue
         cards.setdefault(d["Key"], {k: d.get(k) for k in ("Name", "Type", "Rarity", "SubType", "ManaCost", "Power", "Health")})
-    for f in glob.glob(os.path.join(GAME_DIR, "Data", "*", "*", "current", "LocationData", "GameData_Locations_Data_*.json")):
+    for f in each("Data", "*", "*", "current", "LocationData", "GameData_Locations_Data_*.json"):
         try:
             d = json.load(open(f))
         except Exception:
@@ -90,6 +99,28 @@ def load_card_db():
 
 def base_key(variant_key):
     return variant_key.split("_V")[0]
+
+
+def detect_build(replay_path):
+    """Which build (Demo / Playtest / release) produced a replay.
+
+    Windows keeps one data folder per build, so the folder name says. macOS shares
+    one folder, but each build keeps its own Player.log under ~/Library/Logs, and
+    the log of the build that was running is written right after the replay.
+    """
+    folder = os.path.basename(os.path.dirname(replay_path))
+    if folder.startswith("Origins TCG"):
+        return folder.replace("Origins TCG", "").strip() or "Release"
+    if sys.platform == "darwin":
+        t = os.path.getmtime(replay_path)
+        best, best_dt = None, 30 * 60
+        for log in glob.glob(os.path.expanduser("~/Library/Logs/Koin Games/*/Player.log")):
+            dt = os.path.getmtime(log) - t
+            if -60 <= dt < best_dt:
+                best, best_dt = os.path.basename(os.path.dirname(log)), dt
+        if best:
+            return best.replace("Origins TCG", "").strip() or "Release"
+    return None
 
 
 # ----------------------------------------------------------------------------- decoding
@@ -127,6 +158,7 @@ def decode_replay(path):
     return {
         "file": os.path.basename(path),
         "played_at": played_at,
+        "build": detect_build(path),
         "me": me, "opp": opp,
         "arena": conf.get(0), "seed": conf.get(1), "location_pool": conf.get(37),
         "header_flag": d.get(1),           # candidate result field, unverified
@@ -156,6 +188,9 @@ def db():
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
+    cols = {r["name"] for r in c.execute("PRAGMA table_info(matches)")}
+    if "build" not in cols:
+        c.execute("ALTER TABLE matches ADD COLUMN build TEXT")
     return c
 
 
@@ -163,6 +198,9 @@ def ingest(path, conn=None):
     conn = conn or db()
     rec = decode_replay(path)
     if conn.execute("SELECT 1 FROM matches WHERE id=?", (rec["file"],)).fetchone():
+        if rec["build"]:  # backfill for rows imported before builds were tracked
+            conn.execute("UPDATE matches SET build=? WHERE id=? AND build IS NULL", (rec["build"], rec["file"]))
+            conn.commit()
         return None
     os.makedirs(REPLAY_DIR, exist_ok=True)
     dst = os.path.join(REPLAY_DIR, rec["file"])
@@ -170,12 +208,14 @@ def ingest(path, conn=None):
         shutil.copy2(path, dst)
     me, opp = rec["me"], rec["opp"] or {}
     conn.execute(
-        "INSERT INTO matches VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO matches (id, played_at, me, opp, my_commander, opp_commander, my_rank, opp_rank, my_deck, opp_deck, "
+        "arena, seed, location_pool, rounds, header_flag, my_flag2, my_flag4, opp_flag2, opp_flag4, result, imported_at, build) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rec["file"], rec["played_at"], me["name"], opp.get("name"),
          me["commander"], opp.get("commander"), me["rank"], opp.get("rank"),
          json.dumps(me["deck"]), json.dumps(opp.get("deck", [])), rec["arena"], rec["seed"], rec["location_pool"],
          rec["rounds"], rec["header_flag"], me["flag2"], me["flag4"], opp.get("flag2"), opp.get("flag4"),
-         None, datetime.now().isoformat(sep=" ")))
+         None, datetime.now().isoformat(sep=" "), rec["build"]))
     conn.executemany("INSERT INTO placements VALUES (?,?,?,?,?,?)",
                      [(rec["file"], *p) for p in rec["placements"]])
     conn.commit()
@@ -183,7 +223,7 @@ def ingest(path, conn=None):
 
 
 def game_replays():
-    return sorted(glob.glob(os.path.join(GAME_DIR, "LatestMatch_*.replay")))
+    return sorted(p for g in GAME_DIRS for p in glob.glob(os.path.join(g, "LatestMatch_*.replay")))
 
 
 def cmd_import():
@@ -201,7 +241,7 @@ def cmd_watch(interval=2.0):
     seen = set(os.path.basename(p) for p in game_replays())
     for p in game_replays():
         ingest(p, conn)
-    print(f"watching {GAME_DIR} (ctrl-c to stop)")
+    print("watching " + ", ".join(GAME_DIRS) + " (ctrl-c to stop)")
     while True:
         for p in game_replays():
             name = os.path.basename(p)
@@ -234,7 +274,7 @@ def cmd_label(result, match_id=None):
 # ----------------------------------------------------------------------------- stats
 def onboarding_record():
     """W/L string the client caches from Beamable for the onboarding bot matches."""
-    for f in glob.glob(os.path.join(GAME_DIR, "beamable", "cache", "*", "*", "*", "*.json")):
+    for f in sorted(p for g in GAME_DIRS for p in glob.glob(os.path.join(g, "beamable", "cache", "*", "*", "*", "*.json"))):
         try:
             d = json.load(open(f))
         except Exception:
@@ -289,17 +329,21 @@ def compute_stats(conn):
     opp_rows = sorted(({"key": k, "name": name(k), **g, "lossrate": g["losses"] / g["games"]}
                        for k, g in opp_card_stats.items()), key=lambda c: (-c["games"], -c["lossrate"]))
 
-    # rank as recorded in each replay; a new entry each time it changes
-    rank_history = []
+    # rank as recorded in each replay, tracked per build since each build has its
+    # own ladder; a new entry each time it changes
+    rank_history, last_by_build = [], {}
     for r in rows:
-        if r["my_rank"] and (not rank_history or rank_history[-1]["rank"] != r["my_rank"]):
-            rank_history.append({"rank": r["my_rank"], "since": r["played_at"]})
-    current_rank = rows[-1]["my_rank"] if rows else None
+        b = r["build"] or "?"
+        if r["my_rank"] and last_by_build.get(b) != r["my_rank"]:
+            rank_history.append({"build": b, "rank": r["my_rank"], "since": r["played_at"]})
+            last_by_build[b] = r["my_rank"]
+    current_rank = ", ".join(f"{rk} ({b})" for b, rk in last_by_build.items()) or None
 
     return {
         "total": len(rows), "labeled": len(labeled), "unlabeled": len(rows) - len(labeled),
         "current_rank": current_rank, "rank_history": rank_history,
-        "by_my_rank": group(lambda r: r["my_rank"]),
+        "by_my_rank": group(lambda r: f"{r['my_rank']} ({r['build'] or '?'})"),
+        "by_build": group(lambda r: r["build"] or "?"),
         "wins": wins, "losses": len(labeled) - wins,
         "winrate": (wins / len(labeled)) if labeled else None,
         "by_my_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["my_commander"])],
@@ -321,7 +365,7 @@ def cmd_stats():
         print(f"record: {s['wins']}-{s['losses']}  win rate {s['winrate']:.0%}")
     if s["current_rank"]:
         print(f"rank: {s['current_rank']}  (" +
-              ", ".join(f"{h['rank']} from {h['since'][:10]}" for h in s["rank_history"]) + ")")
+              ", ".join(f"{h['rank']} on {h['build']} from {h['since'][:10]}" for h in s["rank_history"]) + ")")
     if s["onboarding"]:
         o = s["onboarding"]
         print(f"onboarding bot matches (from game cache): {o['wins']}-{o['losses']} "
@@ -337,7 +381,7 @@ def cmd_stats():
     if s["matches"]:
         print("\nrecent matches")
         for m in s["matches"][:15]:
-            print(f"  {m['played_at']}  {m['result'] or '?'}  [{m['my_rank']}] {m['my_commander_name']} vs "
+            print(f"  {m['played_at']}  {m['result'] or '?'}  [{m['build'] or '?'} {m['my_rank']}] {m['my_commander_name']} vs "
                   f"{m['opp_commander_name']} ({m['opp']}, {m['opp_rank']})  {m['rounds']} rounds")
 
 
