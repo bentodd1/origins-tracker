@@ -39,6 +39,9 @@ location pool, both players' names, ranks, commanders and full 13-card decks, th
 40 round records each holding committed placements, a timed event log (draws,
 drags/drops, ready clicks, phase advances, emotes) and each player's mouse track.
 
+Bot opponents are marked as such: the replay stores an is-bot flag per player, and a
+bot's player id is the literal string `Bot`. Bots also leave no mouse-cursor track.
+
 **The file does not say who won.** Mark each match W/L in the dashboard. The
 tracker stores a few unexplained header flags per match so once a handful are
 labeled we can check whether one of them is the result.

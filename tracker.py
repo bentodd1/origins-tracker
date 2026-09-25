@@ -112,11 +112,14 @@ def detect_build(replay_path):
     if folder.startswith("Origins TCG"):
         return folder.replace("Origins TCG", "").strip() or "Release"
     if sys.platform == "darwin":
+        # The running build's log is written at launch and at scene changes, so
+        # it is the one whose timestamp is nearest the replay's on either side.
+        # Anything more than a few hours away belongs to an older session.
         t = os.path.getmtime(replay_path)
-        best, best_dt = None, 30 * 60
+        best, best_dt = None, 6 * 3600
         for log in glob.glob(os.path.expanduser("~/Library/Logs/Koin Games/*/Player.log")):
-            dt = os.path.getmtime(log) - t
-            if -60 <= dt < best_dt:
+            dt = abs(os.path.getmtime(log) - t)
+            if dt < best_dt:
                 best, best_dt = os.path.basename(os.path.dirname(log)), dt
         if best:
             return best.replace("Origins TCG", "").strip() or "Release"
@@ -136,9 +139,9 @@ def decode_replay(path):
         deck = [c[0] for c in p[5][0] if not c[0].startswith("Tower")]
         players.append({
             "index": idx,
-            "beamable_id": p[0],
+            "beamable_id": p[0],           # "Bot" for a bot opponent
             "name": p[1],
-            "flag2": p.get(2),
+            "flag2": p.get(2),             # is-bot flag
             "flag4": p.get(4),
             "rank": p.get(7),
             "avatar": p.get(8),
@@ -343,6 +346,11 @@ def compute_stats(conn, build=None):
                        for k, g in opp_card_stats.items()), key=lambda c: (-c["games"], -c["lossrate"]))
 
     def opp_type(r):
+        # Player field 2 is the game's own is-bot flag (True for a bot, whose id is
+        # also the literal string "Bot"). The cursor count is a fallback for
+        # rows imported before the flag was understood.
+        if r["opp_flag2"]:
+            return "Bot"
         n = r["opp_cursor_points"]
         return "?" if n is None else ("Bot" if n == 0 else "Human")
 
