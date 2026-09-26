@@ -105,13 +105,14 @@ async function load() {
 
   const mt = document.getElementById('matches');
   if (!s.matches.length) mt.innerHTML = `<tr><td class="empty">No ${build==='all'?'':esc(build)+' '}matches yet. Play a game with the tracker running.</td></tr>`;
-  else mt.innerHTML = '<tr><th>When</th><th>Result</th><th>Build</th><th>My rank</th><th>Me</th><th>Opponent</th><th>Their rank</th><th>Bot?</th><th class="num">Rounds</th><th>My deck</th><th>Their deck</th></tr>' +
+  else mt.innerHTML = '<tr><th>When</th><th>Result</th><th>Build</th><th>My rank</th><th>Rank after</th><th>Me</th><th>Opponent</th><th>Their rank</th><th>Bot?</th><th class="num">Rounds</th><th>My deck</th><th>Their deck</th></tr>' +
     s.matches.map(m => `<tr>
       <td>${esc(m.played_at)}</td>
       <td><button class="w ${m.result==='W'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='W'?'':'W'}')">W</button>
           <button class="l ${m.result==='L'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='L'?'':'L'}')">L</button></td>
       <td>${esc(m.build || '?')}</td>
       <td>${esc(m.my_rank)}</td>
+      <td class="${m.rank_after && m.rank_after !== m.my_rank ? 'W' : ''}">${m.rank_after ? (m.rank_after === m.my_rank ? '=' : esc(m.rank_after)) : '<span class="deck">next match</span>'}</td>
       <td>${esc(m.my_commander_name)}</td>
       <td>${esc(m.opp_commander_name)} <span class="deck">(${esc(m.opp)})</span></td>
       <td>${esc(m.opp_rank)}</td><td>${esc(m.opp_type)}</td><td class="num">${m.rounds}</td>

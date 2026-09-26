@@ -367,6 +367,17 @@ def compute_stats(conn, build=None):
     else:
         current_rank = ", ".join(f"{rk} ({b})" for b, rk in last_by_build.items()) or None
 
+    # The header rank is the rank at match start, so the next match on the same
+    # build reveals what this one did to it. Uses all matches, not just the
+    # filtered ones, so the tab filter never hides the following match.
+    rank_after = {}
+    prev_by_build = {}
+    for r in all_rows:
+        b = r["build"] or "?"
+        if b in prev_by_build:
+            rank_after[prev_by_build[b]] = r["my_rank"]
+        prev_by_build[b] = r["id"]
+
     return {
         "build": build, "builds": builds, "latest_build": latest_build,
         "total": len(rows), "labeled": len(labeled), "unlabeled": len(rows) - len(labeled),
@@ -382,7 +393,7 @@ def compute_stats(conn, build=None):
         "cards": card_rows,
         "opp_cards": opp_rows,
         "onboarding": onboarding_record(),
-        "matches": [{**dict(r), "opp_type": opp_type(r),
+        "matches": [{**dict(r), "opp_type": opp_type(r), "rank_after": rank_after.get(r["id"]),
                      "my_commander_name": name(r["my_commander"]), "opp_commander_name": name(r["opp_commander"]),
                      "my_deck_names": [name(k) for k in json.loads(r["my_deck"])],
                      "opp_deck_names": [name(k) for k in json.loads(r["opp_deck"])]} for r in reversed(rows)],
