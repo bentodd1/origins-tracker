@@ -42,9 +42,15 @@ drags/drops, ready clicks, phase advances, emotes) and each player's mouse track
 Bot opponents are marked as such: the replay stores an is-bot flag per player, and a
 bot's player id is the literal string `Bot`. Bots also leave no mouse-cursor track.
 
-**The file does not say who won.** Mark each match W/L in the dashboard. The
-tracker stores a few unexplained header flags per match so once a handful are
-labeled we can check whether one of them is the result.
+**The file does not say who won.** Mark each match W/L in the dashboard. This was
+checked against seven wins and a conceded loss: every unexplained header field is
+identical across all of them, and a concede adds no event of its own — the round
+log simply stops. The replay is an input log the game re-simulates from the seed,
+so the outcome is never written down.
+
+The one indirect check is the ladder. Each header carries your rank at match
+start, so the next match on the same build shows what the previous one did to it;
+the dashboard's "Rank after" column surfaces that, and a rise confirms a win.
 
 Cards inside round events are referenced by a per-match instance id, not a deck
 slot, so "cards played" stats need the id mapping worked out from several

@@ -168,7 +168,7 @@ def decode_replay(path):
         "build": detect_build(path),
         "me": me, "opp": opp,
         "arena": conf.get(0), "seed": conf.get(1), "location_pool": conf.get(37),
-        "header_flag": d.get(1),           # candidate result field, unverified
+        "header_flag": d.get(1),           # always 0 so far, wins and a concede alike; not the result
         "rounds": len(rounds),
         "placements": placements,
         "size": len(raw),
