@@ -20,7 +20,10 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -196,7 +199,8 @@ def db():
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
     cols = {r["name"] for r in c.execute("PRAGMA table_info(matches)")}
-    for col, typ in (("build", "TEXT"), ("my_cursor_points", "INTEGER"), ("opp_cursor_points", "INTEGER")):
+    for col, typ in (("build", "TEXT"), ("my_cursor_points", "INTEGER"), ("opp_cursor_points", "INTEGER"),
+                     ("result_source", "TEXT")):
         if col not in cols:
             c.execute(f"ALTER TABLE matches ADD COLUMN {col} {typ}")
     return c
@@ -234,6 +238,61 @@ def ingest(path, conn=None):
     return rec
 
 
+OCR_BIN = os.path.join(HERE, "ocr")
+OCR_SRC = os.path.join(HERE, "ocr.swift")
+
+
+def ocr_screen():
+    """Text lines currently visible on the main display (macOS only, needs Screen
+    Recording permission for the terminal). Returns [] if anything fails."""
+    if sys.platform != "darwin":
+        return []
+    if not os.path.exists(OCR_BIN) and os.path.exists(OCR_SRC):
+        subprocess.run(["swiftc", "-O", OCR_SRC, "-o", OCR_BIN], capture_output=True)
+    if not os.path.exists(OCR_BIN):
+        return []
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        shot = f.name
+    try:
+        subprocess.run(["screencapture", "-x", shot], capture_output=True, timeout=10)
+        out = subprocess.run([OCR_BIN, shot], capture_output=True, text=True, timeout=30).stdout
+        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+    except Exception:
+        return []
+    finally:
+        try:
+            os.unlink(shot)
+        except OSError:
+            pass
+
+
+def result_on_screen(lines):
+    """W/L if the results screen banner is among the OCR lines, else None.
+    Whole-line match only: "Victory Points" is on the screen after a loss too."""
+    for ln in lines:
+        w = re.sub(r"[^a-z]", "", ln.lower())
+        if w == "victory":
+            return "W"
+        if w == "defeat":
+            return "L"
+    return None
+
+
+def auto_label(match_id, attempts=6, interval=1.5):
+    """Try for a few seconds to read the results screen and label the match."""
+    for _ in range(attempts):
+        res = result_on_screen(ocr_screen())
+        if res:
+            conn = db()
+            conn.execute("UPDATE matches SET result=?, result_source='screen' WHERE id=? AND result IS NULL", (res, match_id))
+            conn.commit()
+            print(f"[{datetime.now():%H:%M:%S}] results screen read: {res}")
+            return res
+        time.sleep(interval)
+    print(f"[{datetime.now():%H:%M:%S}] could not read the results screen; mark it W/L in the dashboard")
+    return None
+
+
 def game_replays():
     return sorted(p for g in GAME_DIRS for p in glob.glob(os.path.join(g, "LatestMatch_*.replay")))
 
@@ -248,12 +307,13 @@ def cmd_import():
     print(f"{n} new match(es)")
 
 
-def cmd_watch(interval=2.0):
+def cmd_watch(interval=1.0, quiet=False):
     conn = db()
     seen = set(os.path.basename(p) for p in game_replays())
     for p in game_replays():
         ingest(p, conn)
-    print("watching " + ", ".join(GAME_DIRS) + " (ctrl-c to stop)")
+    if not quiet:
+        print("watching " + ", ".join(GAME_DIRS) + " (ctrl-c to stop)")
     while True:
         for p in game_replays():
             name = os.path.basename(p)
@@ -264,7 +324,8 @@ def cmd_watch(interval=2.0):
             seen.add(name)
             if rec:
                 print(f"[{datetime.now():%H:%M:%S}] new match: {rec['me']['name']} vs {rec['opp']['name']} "
-                      f"({rec['rounds']} rounds). Mark it: python3 tracker.py label W|L")
+                      f"({rec['rounds']} rounds)")
+                auto_label(rec["file"])
         time.sleep(interval)
 
 
@@ -451,8 +512,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, dashboard_html(), "text/html")
         if u.path == "/api/stats":
             conn = db()
-            for p in game_replays():
-                ingest(p, conn)
             build = parse_qs(u.query).get("build", [None])[0] or None
             return self._send(200, json.dumps(compute_stats(conn, build), default=str))
         self._send(404, "{}")
@@ -463,15 +522,14 @@ class Handler(BaseHTTPRequestHandler):
             q = parse_qs(u.query)
             mid, res = q.get("id", [None])[0], q.get("result", [None])[0]
             conn = db()
-            conn.execute("UPDATE matches SET result=? WHERE id=?", (res if res in ("W", "L") else None, mid))
+            conn.execute("UPDATE matches SET result=?, result_source=? WHERE id=?",
+                         (res if res in ("W", "L") else None, "manual" if res in ("W", "L") else None, mid))
             conn.commit()
             return self._send(200, "{}")
         self._send(404, "{}")
 
 
 def cmd_serve(port=8787):
-    for p in game_replays():
-        ingest(p)
     try:
         server = HTTPServer(("127.0.0.1", port), Handler)
     except OSError as e:
@@ -480,6 +538,7 @@ def cmd_serve(port=8787):
                      f"Try: python3 tracker.py serve {port + 1}")
         raise
     print(f"dashboard: http://localhost:{port}")
+    threading.Thread(target=cmd_watch, kwargs={"quiet": True}, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

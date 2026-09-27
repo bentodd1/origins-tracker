@@ -48,6 +48,15 @@ identical across all of them, and a concede adds no event of its own — the rou
 log simply stops. The replay is an input log the game re-simulates from the seed,
 so the outcome is never written down.
 
+**Automatic labeling from the results screen (macOS).** When a new replay lands
+the tracker takes a screenshot, reads it with the built-in Vision OCR (`ocr.swift`,
+compiled on first use), and labels the match if the Victory or Defeat banner is on
+screen. It needs **Screen Recording** permission for whatever app hosts the terminal
+you run the tracker from (System Settings > Privacy & Security > Screen Recording);
+without it macOS hands back a windowless capture and the match simply stays
+unlabeled for you to click. Only a whole-line "Victory" or "Defeat" counts, because
+"Victory Points" appears on the screen after a loss as well.
+
 The one indirect check is the ladder. Each header carries your rank at match
 start, so the next match on the same build shows what the previous one did to it;
 the dashboard's "Rank after" column surfaces that, and a rise confirms a win.

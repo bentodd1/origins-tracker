@@ -109,7 +109,7 @@ async function load() {
     s.matches.map(m => `<tr>
       <td>${esc(m.played_at)}</td>
       <td><button class="w ${m.result==='W'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='W'?'':'W'}')">W</button>
-          <button class="l ${m.result==='L'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='L'?'':'L'}')">L</button></td>
+          <button class="l ${m.result==='L'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='L'?'':'L'}')">L</button>${m.result_source==='screen'?' <span class="deck" title="read from the results screen">auto</span>':''}</td>
       <td>${esc(m.build || '?')}</td>
       <td>${esc(m.my_rank)}</td>
       <td class="${m.rank_after && m.rank_after !== m.my_rank ? 'W' : ''}">${m.rank_after ? (m.rank_after === m.my_rank ? '=' : esc(m.rank_after)) : '<span class="deck">next match</span>'}</td>
