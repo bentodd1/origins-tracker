@@ -293,10 +293,12 @@ def result_on_screen(lines):
 def auto_label(match_id, attempts=12, interval=2.0):
     """Try for about half a minute to read the results screen and label the match.
     The first, middle and last captures of a failed run are kept for inspection."""
+    shutil.rmtree(DEBUG_DIR, ignore_errors=True)   # captures from the previous run
     for i in range(attempts):
         keep = f"attempt{i:02d}" if i in (0, attempts // 2, attempts - 1) else None
         res = result_on_screen(ocr_screen(keep_as=keep))
         if res:
+            shutil.rmtree(DEBUG_DIR, ignore_errors=True)   # only a failed read keeps its captures
             conn = db()
             conn.execute("UPDATE matches SET result=?, result_source='screen' WHERE id=? AND result IS NULL", (res, match_id))
             conn.commit()
