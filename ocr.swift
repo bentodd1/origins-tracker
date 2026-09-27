@@ -16,6 +16,6 @@ let request = VNRecognizeTextRequest { req, _ in
         if let top = obs.topCandidates(1).first { print(top.string) }
     }
 }
-request.recognitionLevel = .fast
+request.recognitionLevel = .accurate  // stylized banner text needs it
 request.usesLanguageCorrection = false
 try? VNImageRequestHandler(cgImage: cg, options: [:]).perform([request])

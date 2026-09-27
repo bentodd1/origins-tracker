@@ -242,9 +242,14 @@ OCR_BIN = os.path.join(HERE, "ocr")
 OCR_SRC = os.path.join(HERE, "ocr.swift")
 
 
-def ocr_screen():
+DEBUG_DIR = os.path.join(DATA_DIR, "debug")
+
+
+def ocr_screen(keep_as=None):
     """Text lines currently visible on the main display (macOS only, needs Screen
-    Recording permission for the terminal). Returns [] if anything fails."""
+    Recording permission for the terminal). Returns [] if anything fails.
+    keep_as: if set, the capture and the lines read are kept under data/debug/
+    with that name so a failed read can be inspected. Never committed."""
     if sys.platform != "darwin":
         return []
     if not os.path.exists(OCR_BIN) and os.path.exists(OCR_SRC):
@@ -256,7 +261,14 @@ def ocr_screen():
     try:
         subprocess.run(["screencapture", "-x", shot], capture_output=True, timeout=10)
         out = subprocess.run([OCR_BIN, shot], capture_output=True, text=True, timeout=30).stdout
-        return [ln.strip() for ln in out.splitlines() if ln.strip()]
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if keep_as:
+            os.makedirs(DEBUG_DIR, exist_ok=True)
+            subprocess.run(["sips", "-Z", "1600", shot, "--out", os.path.join(DEBUG_DIR, keep_as + ".png")],
+                           capture_output=True)
+            with open(os.path.join(DEBUG_DIR, keep_as + ".txt"), "w") as fh:
+                fh.write("\n".join(lines))
+        return lines
     except Exception:
         return []
     finally:
@@ -278,10 +290,12 @@ def result_on_screen(lines):
     return None
 
 
-def auto_label(match_id, attempts=6, interval=1.5):
-    """Try for a few seconds to read the results screen and label the match."""
-    for _ in range(attempts):
-        res = result_on_screen(ocr_screen())
+def auto_label(match_id, attempts=12, interval=2.0):
+    """Try for about half a minute to read the results screen and label the match.
+    The first, middle and last captures of a failed run are kept for inspection."""
+    for i in range(attempts):
+        keep = f"attempt{i:02d}" if i in (0, attempts // 2, attempts - 1) else None
+        res = result_on_screen(ocr_screen(keep_as=keep))
         if res:
             conn = db()
             conn.execute("UPDATE matches SET result=?, result_source='screen' WHERE id=? AND result IS NULL", (res, match_id))
