@@ -561,7 +561,7 @@ def compute_stats(conn, build=None):
         card_rows.append({"key": key, "name": c.get("Name", key), "cost": c.get("ManaCost"), "type": c.get("Type"),
                           "rarity": c.get("Rarity"), **g, "winrate": g["wins"] / g["games"],
                           **played_cols(played.get(key))})
-    card_rows.sort(key=lambda c: (-c["games"], -c["winrate"], c["name"]))
+    card_rows.sort(key=lambda c: (-c["played_games"], -(c["played_winrate"] or 0), c["name"]))
 
     opp_card_stats = {}
     for r in labeled:
@@ -656,10 +656,13 @@ def cmd_stats(build=None):
         for g in s["by_my_commander"]:
             print(f"  {g['name']:<24} {g['wins']}-{g['games'] - g['wins']}  {g['winrate']:.0%}")
     if s["cards"]:
-        print("\nmy cards                        in deck          when played")
+        print("\nmy cards, in games I played them   games  record  win rate  avg turn")
         for c in s["cards"]:
-            pw = f"{c['played_games']:>3} games {c['played_winrate']:>4.0%}  avg turn {c['avg_turn']:.1f}" if c["played_games"] else "  never played"
-            print(f"  {c['name']:<28} {c['games']:>3} games {c['winrate']:>4.0%}   {pw}")
+            if c["played_games"]:
+                print(f"  {c['name']:<32} {c['played_games']:>5}  {c['played_wins']:>2}-{c['played_games'] - c['played_wins']:<3}  "
+                      f"{c['played_winrate']:>7.0%}  {c['avg_turn']:>8.1f}")
+            else:
+                print(f"  {c['name']:<32}     0  not played in {c['games']} games it was in the deck")
     if s["matches"]:
         print("\nrecent matches")
         for m in s["matches"][:15]:

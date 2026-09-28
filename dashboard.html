@@ -44,20 +44,20 @@
     <div class="tiles" id="tiles"></div>
   </section>
   <section class="wide">
-    <h2>Matches <span style="font-weight:400;text-transform:none;letter-spacing:0">— click W or L after each game; the replay does not record the winner. "Rank after" is your rank at the start of the next match: a rise confirms a win.</span></h2>
-    <div class="wrap"><table id="matches"></table></div>
-  </section>
-  <section class="wide">
     <h2>By deck</h2>
     <div class="wrap"><table id="decks"></table></div>
   </section>
-  <section>
-    <h2>My cards — in deck vs when played <span style="font-weight:400;text-transform:none;letter-spacing:0">(draws are not in the replay; plays are)</span></h2>
+  <section class="wide">
+    <h2>My cards — win rate in games I played them <span style="font-weight:400;text-transform:none;letter-spacing:0">(click a column to sort)</span></h2>
     <div class="wrap"><table id="cards"></table></div>
   </section>
-  <section>
-    <h2>Opponent cards — how often I lose against them</h2>
+  <section class="wide">
+    <h2>Opponent cards — how often I lose when they play them <span style="font-weight:400;text-transform:none;letter-spacing:0">(click a column to sort)</span></h2>
     <div class="wrap"><table id="oppcards"></table></div>
+  </section>
+  <section class="wide">
+    <h2>Matches <span style="font-weight:400;text-transform:none;letter-spacing:0">— click W or L after each game; the replay does not record the winner. "Rank after" is your rank at the start of the next match: a rise confirms a win.</span></h2>
+    <div class="wrap"><table id="matches"></table></div>
   </section>
   <section>
     <h2>Rank history</h2>
@@ -114,7 +114,7 @@ async function load() {
   const mt = document.getElementById('matches');
   if (!s.matches.length) mt.innerHTML = `<tr><td class="empty">No ${build==='all'?'':esc(build)+' '}matches yet. Play a game with the tracker running.</td></tr>`;
   else mt.innerHTML = '<tr><th>When</th><th>Result</th><th>Build</th><th>My rank</th><th>Rank after</th><th>Me</th><th>Opponent</th><th>Their rank</th><th>Bot?</th><th class="num">Rounds</th><th>My deck</th><th>Their deck</th></tr>' +
-    s.matches.map(m => `<tr>
+    (showAllMatches ? s.matches : s.matches.slice(0, 10)).map(m => `<tr>
       <td>${esc(m.played_at)}</td>
       <td><button class="w ${m.result==='W'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='W'?'':'W'}')">W</button>
           <button class="l ${m.result==='L'?'on':''}" onclick="label('${esc(m.id)}','${m.result==='L'?'':'L'}')">L</button>${m.result_source==='screen'?' <span class="deck" title="read from the results screen">auto</span>':''}</td>
@@ -125,13 +125,23 @@ async function load() {
       <td>${esc(m.opp_commander_name)} <span class="deck">(${esc(m.opp)})</span></td>
       <td>${esc(m.opp_rank)}</td><td>${esc(m.opp_type)}</td><td class="num">${m.rounds}</td>
       <td class="deck">${m.my_deck_names.map(esc).join(', ')}</td>
-      <td class="deck">${m.opp_deck_names.map(esc).join(', ')}</td></tr>`).join('');
+      <td class="deck">${m.opp_deck_names.map(esc).join(', ')}</td></tr>`).join('') +
+    (s.matches.length > 10 ? `<tr><td colspan="12"><button onclick="toggleMatches()">${showAllMatches ? 'Show last 10' : `Show all ${s.matches.length} matches`}</button></td></tr>` : '');
 
   const rows = (id, list, cols) => {
     const el = document.getElementById(id);
     if (!list.length) { el.innerHTML = '<tr><td class="empty">Nothing yet — label a match first.</td></tr>'; return; }
     el.innerHTML = '<tr>' + cols.map(c => `<th class="${c.num?'num':''}">${c.h}</th>`).join('') + '</tr>' +
       list.map(r => '<tr>' + cols.map(c => `<td class="${c.num?'num':''}">${c.f(r)}</td>`).join('') + '</tr>').join('');
+  };
+  const sortable = (id, list, cols, defKey) => {
+    const st = sortState[id] || (sortState[id] = {k: defKey, dir: -1});
+    const data = list.slice().sort((a, b) => {
+      const x = a[st.k], y = b[st.k];
+      if (x == null && y == null) return 0; if (x == null) return 1; if (y == null) return -1;
+      return (typeof x === 'string' ? x.localeCompare(y) : x - y) * st.dir;
+    });
+    rows(id, data, cols.map(c => ({...c, h: `<span style="cursor:pointer" onclick="sortBy('${id}','${c.k}')">${c.h}${st.k===c.k ? (st.dir<0?' ▾':' ▴') : ''}</span>`})));
   };
   const rate = r => `<span class="bar" style="width:${Math.round((r)*60)}px"></span> ${pct(r)}`;
   rows('decks', s.by_deck, [
@@ -140,14 +150,21 @@ async function load() {
     {h:'vs Humans', num:true, f:r=>`${r.human_w}-${r.human_l}`}, {h:'vs Bots', num:true, f:r=>`${r.bot_w}-${r.bot_l}`},
     {h:'Last played', f:r=>esc((r.last||'').slice(0,16))},
     {h:'Cards', f:r=>`<span class="deck">${r.cards.map(esc).join(', ')}</span>`}]);
-  rows('cards', s.cards, [
-    {h:'Card', f:r=>esc(r.name)}, {h:'Cost', num:true, f:r=>r.cost ?? ''}, {h:'Type', f:r=>esc(r.type||'')},
-    {h:'In deck', num:true, f:r=>r.games}, {h:'Win rate', f:r=>rate(r.winrate)},
-    {h:'Played in', num:true, f:r=>r.played_games}, {h:'Win rate when played', f:r=>r.played_winrate==null?'<span class="deck">never played</span>':rate(r.played_winrate)},
-    {h:'Avg turn', num:true, f:r=>r.avg_turn==null?'':r.avg_turn.toFixed(1)}]);
-  rows('oppcards', s.opp_cards, [
-    {h:'Card', f:r=>esc(r.name)}, {h:'In their deck', num:true, f:r=>r.games}, {h:'Loss rate', f:r=>rate(r.lossrate)},
-    {h:'Played in', num:true, f:r=>r.played_games}, {h:'Loss rate when played', f:r=>r.played_winrate==null?'<span class="deck">never played</span>':rate(r.played_winrate)}]);
+  const never = '<span class="deck">not played</span>';
+  sortable('cards', s.cards.filter(r => r.games), [
+    {h:'Card', k:'name', f:r=>`<b>${esc(r.name)}</b>`}, {h:'Cost', k:'cost', num:true, f:r=>r.cost ?? ''}, {h:'Type', k:'type', f:r=>esc(r.type||'')},
+    {h:'Games played', k:'played_games', num:true, f:r=>r.played_games},
+    {h:'Record', k:'played_wins', num:true, f:r=>r.played_games ? `${r.played_wins}-${r.played_games - r.played_wins}` : ''},
+    {h:'Win rate', k:'played_winrate', f:r=>r.played_winrate==null ? never : rate(r.played_winrate)},
+    {h:'Times played', k:'plays', num:true, f:r=>r.plays || ''},
+    {h:'Avg turn', k:'avg_turn', num:true, f:r=>r.avg_turn==null?'':r.avg_turn.toFixed(1)},
+    {h:'Games in deck', k:'games', num:true, f:r=>`<span class="deck">${r.games}</span>`}], 'played_games');
+  sortable('oppcards', s.opp_cards, [
+    {h:'Card', k:'name', f:r=>`<b>${esc(r.name)}</b>`},
+    {h:'Games they played it', k:'played_games', num:true, f:r=>r.played_games},
+    {h:'My record', k:'played_wins', num:true, f:r=>r.played_games ? `${r.played_games - r.played_wins}-${r.played_wins}` : ''},
+    {h:'My loss rate', k:'played_winrate', f:r=>r.played_winrate==null ? never : rate(r.played_winrate)},
+    {h:'Games in their deck', k:'games', num:true, f:r=>`<span class="deck">${r.games}</span>`}], 'played_games');
   rows('rank', s.rank_history.slice().reverse(), [
     {h:'Build', f:r=>esc(r.build)}, {h:'Rank', f:r=>esc(r.rank)}, {h:'Since', f:r=>esc(r.since)}]);
   document.getElementById('bybuild-section').hidden = build !== 'all';
@@ -162,6 +179,14 @@ async function load() {
   rows('oppcmd', s.by_opp_commander, [
     {h:'Commander', f:r=>esc(r.name)}, {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
 }
+const sortState = {};
+function sortBy(id, k) {
+  const st = sortState[id];
+  if (st.k === k) st.dir = -st.dir; else { st.k = k; st.dir = k === 'name' || k === 'type' ? 1 : -1; }
+  load();
+}
+let showAllMatches = false;
+function toggleMatches() { showAllMatches = !showAllMatches; load(); }
 async function label(id, result) {
   await fetch(`/api/label?id=${encodeURIComponent(id)}&result=${result}`, {method:'POST'});
   load();
