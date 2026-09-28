@@ -100,8 +100,87 @@ def load_card_db():
     return cards, locations
 
 
+def load_named_decks():
+    """Deck names from the inventory the client caches: [(name, frozenset(card keys))].
+    Commander and tower entries are dropped so the set matches a replay decklist.
+    Every cached snapshot is read, so an older version of an edited deck still matches."""
+    decks, seen = [], set()
+
+    def add(name, keys):
+        cards = frozenset(k for k in keys if k and not k.startswith(("H", "Tower")))
+        if name and cards and (name, cards) not in seen:
+            seen.add((name, cards))
+            decks.append((name, cards))
+
+    for g in GAME_DIRS:
+        for f in sorted(glob.glob(os.path.join(g, "beamable", "cache", "*", "*", "*", "*.json")), key=os.path.getmtime, reverse=True):
+            try:
+                d = json.load(open(f))
+            except Exception:
+                continue
+            if not (isinstance(d, dict) and "items" in d and "currencies" in d):
+                continue
+            for grp in d["items"]:
+                if not grp.get("id", "").startswith("items.Deck."):
+                    continue
+                for it in grp.get("items", []):
+                    props = {p["name"]: p["value"] for p in it.get("properties", [])}
+                    try:
+                        cfg = json.loads(props.get("Config") or "{}")
+                    except Exception:
+                        continue
+                    add(cfg.get("DisplayName"), [c.get("CardKey") for c in cfg.get("Cards", [])])
+    return decks
+
+
+def deck_name(cards, named):
+    """Name for a 13-card list: exact match, else the closest named deck if it
+    shares at least 10 cards (marked as edited), else None."""
+    cards = frozenset(cards)
+    best, best_n = None, 0
+    for name, ref in named:
+        if ref == cards:
+            return name
+        n = len(ref & cards)
+        if n > best_n:
+            best, best_n = name, n
+    return f"{best} (edited)" if best and best_n >= 10 else None
+
+
 def base_key(variant_key):
     return variant_key.split("_V")[0]
+
+
+_CARD_DB = None
+
+
+def card_db():
+    global _CARD_DB
+    if _CARD_DB is None:
+        _CARD_DB = load_card_db()[0]
+    return _CARD_DB
+
+
+# Card instance ids inside a replay. Each deck card gets two consecutive ids in
+# decklist order, except a legendary, which has a single copy. Player 0's ids
+# start at 1 and player 1's at 30; ids past the deck are tokens made mid-game.
+# Verified on 25 replays: every no-lane placement maps to a Spell under this
+# scheme (0 misses in 124) and under no neighbouring one.
+INSTANCE_BASE = {0: 1, 1: 30}
+
+
+def expand_deck(deck):
+    out = []
+    for key in deck:
+        c = card_db().get(base_key(key), {})
+        single = c.get("Rarity") == "Legendary" or base_key(key).endswith(("_MC", "_SC"))
+        out += [key] * (1 if single else 2)
+    return out
+
+
+def card_for_instance(player_index, instance_id, expanded):
+    j = (instance_id or -1) - INSTANCE_BASE.get(player_index, 10 ** 9)
+    return expanded[j] if 0 <= j < len(expanded) else None
 
 
 def detect_build(replay_path):
@@ -155,11 +234,14 @@ def decode_replay(path):
     opp = next((p for p in players if p is not me), None)
 
     rounds = d[4]
-    placements = []   # (round, player, instance id, lane, slot)
+    expanded = {p["index"]: expand_deck(p["deck"]) for p in players}
+    placements = []   # (round, player, instance id, lane, slot, card key or None for a token)
     for ri, r in enumerate(rounds):
         for e in r.get(0, []):
             if e.get(0) == COMMIT_PLACE:
-                placements.append((ri, e.get(2), e.get(50), e.get(51), e.get(53)))
+                pi = e.get(2)
+                placements.append((ri, pi, e.get(50), e.get(51), e.get(53),
+                                   card_for_instance(pi, e.get(50), expanded.get(pi, []))))
     # Mouse-cursor samples per player. A bot has no mouse, so zero samples over a
     # whole match marks the opponent as a bot.
     for p in players:
@@ -169,7 +251,7 @@ def decode_replay(path):
         "file": os.path.basename(path),
         "played_at": played_at,
         "build": detect_build(path),
-        "me": me, "opp": opp,
+        "me": me, "opp": opp, "my_index": me["index"],
         "arena": conf.get(0), "seed": conf.get(1), "location_pool": conf.get(37),
         "header_flag": d.get(1),           # always 0 so far, wins and a concede alike; not the result
         "rounds": len(rounds),
@@ -200,9 +282,11 @@ def db():
     c.executescript(SCHEMA)
     cols = {r["name"] for r in c.execute("PRAGMA table_info(matches)")}
     for col, typ in (("build", "TEXT"), ("my_cursor_points", "INTEGER"), ("opp_cursor_points", "INTEGER"),
-                     ("result_source", "TEXT")):
+                     ("result_source", "TEXT"), ("my_index", "INTEGER")):
         if col not in cols:
             c.execute(f"ALTER TABLE matches ADD COLUMN {col} {typ}")
+    if "card_key" not in {r["name"] for r in c.execute("PRAGMA table_info(placements)")}:
+        c.execute("ALTER TABLE placements ADD COLUMN card_key TEXT")
     return c
 
 
@@ -216,6 +300,10 @@ def ingest(path, conn=None):
             conn.execute("UPDATE matches SET build=? WHERE id=? AND build IS NULL", (rec["build"], rec["file"]))
         conn.execute("UPDATE matches SET my_cursor_points=?, opp_cursor_points=? WHERE id=? AND opp_cursor_points IS NULL",
                      (me["cursor_points"], opp.get("cursor_points"), rec["file"]))
+        conn.execute("UPDATE matches SET my_index=? WHERE id=? AND my_index IS NULL", (rec["my_index"], rec["file"]))
+        if not conn.execute("SELECT 1 FROM placements WHERE match_id=? AND card_key IS NOT NULL", (rec["file"],)).fetchone():
+            conn.execute("DELETE FROM placements WHERE match_id=?", (rec["file"],))
+            insert_placements(conn, rec)
         conn.commit()
         return None
     os.makedirs(REPLAY_DIR, exist_ok=True)
@@ -232,10 +320,16 @@ def ingest(path, conn=None):
          json.dumps(me["deck"]), json.dumps(opp.get("deck", [])), rec["arena"], rec["seed"], rec["location_pool"],
          rec["rounds"], rec["header_flag"], me["flag2"], me["flag4"], opp.get("flag2"), opp.get("flag4"),
          None, datetime.now().isoformat(sep=" "), rec["build"], me["cursor_points"], opp.get("cursor_points")))
-    conn.executemany("INSERT INTO placements VALUES (?,?,?,?,?,?)",
-                     [(rec["file"], *p) for p in rec["placements"]])
+    conn.execute("UPDATE matches SET my_index=? WHERE id=?", (rec["my_index"], rec["file"]))
+    insert_placements(conn, rec)
     conn.commit()
     return rec
+
+
+def insert_placements(conn, rec):
+    conn.executemany(
+        "INSERT INTO placements (match_id, round, player, instance_id, lane, slot, card_key) VALUES (?,?,?,?,?,?,?)",
+        [(rec["file"], *p) for p in rec["placements"]])
 
 
 OCR_BIN = os.path.join(HERE, "ocr")
@@ -400,17 +494,73 @@ def compute_stats(conn, build=None):
         return sorted(({"key": k, **v, "winrate": v["wins"] / v["games"]} for k, v in out.items()),
                       key=lambda g: (-g["games"], -g["winrate"]))
 
+    # record per deck: same commander and same 13 cards = same deck
+    named = load_named_decks()
+    deck_stats = {}
+    for r in rows:
+        deck_cards = json.loads(r["my_deck"])
+        k = (r["my_commander"], tuple(sorted(deck_cards)))
+        d = deck_stats.setdefault(k, {"games": 0, "wins": 0, "losses": 0, "unlabeled": 0,
+                                      "human_w": 0, "human_l": 0, "bot_w": 0, "bot_l": 0,
+                                      "first": r["played_at"], "last": r["played_at"], "cards": deck_cards})
+        d["last"] = r["played_at"]
+        if not r["result"]:
+            d["unlabeled"] += 1
+            continue
+        d["games"] += 1
+        won = r["result"] == "W"
+        d["wins" if won else "losses"] += 1
+        bot = bool(r["opp_flag2"]) or r["opp_cursor_points"] == 0
+        d[("bot" if bot else "human") + ("_w" if won else "_l")] += 1
+    deck_rows, unnamed = [], 0
+    for (cmd, deck_cards), d in sorted(deck_stats.items(), key=lambda kv: kv[1]["first"]):
+        nm = deck_name(deck_cards, named)
+        if not nm:
+            unnamed += 1
+            nm = f"{name(cmd)} deck {unnamed}"
+        deck_rows.append({"name": nm, "commander": name(cmd), **{k: v for k, v in d.items() if k != "cards"},
+                          "winrate": (d["wins"] / d["games"]) if d["games"] else None,
+                          "cards": sorted((name(c) for c in d["cards"]),
+                                          key=lambda n: n)})
+    deck_rows.sort(key=lambda d: (-d["games"], d["name"]))
+
     card_stats = {}
     for r in labeled:
         for key in set(json.loads(r["my_deck"])):
             g = card_stats.setdefault(key, {"games": 0, "wins": 0})
             g["games"] += 1
             g["wins"] += r["result"] == "W"
+    # What was actually played. A turn is four round records; the first placements
+    # land in round 4, which is turn 1.
+    result_of = {r["id"]: r["result"] for r in labeled}
+    my_index = {r["id"]: (r["my_index"] or 0) for r in labeled}
+    played, opp_played = {}, {}
+    if result_of:
+        q = "SELECT match_id, round, player, card_key FROM placements WHERE card_key IS NOT NULL"
+        for pr in conn.execute(q):
+            mid = pr["match_id"]
+            if mid not in result_of:
+                continue
+            mine = pr["player"] == my_index[mid]
+            g = (played if mine else opp_played).setdefault(pr["card_key"], {"matches": {}, "plays": 0, "turns": []})
+            g["plays"] += 1
+            g["turns"].append(pr["round"] // 4)
+            g["matches"][mid] = result_of[mid]
+
+    def played_cols(g, lose=False):
+        if not g:
+            return {"played_games": 0, "played_wins": 0, "played_winrate": None, "plays": 0, "avg_turn": None}
+        res = list(g["matches"].values())
+        hits = sum(1 for x in res if x == ("L" if lose else "W"))
+        return {"played_games": len(res), "played_wins": hits, "played_winrate": hits / len(res),
+                "plays": g["plays"], "avg_turn": sum(g["turns"]) / len(g["turns"])}
+
     card_rows = []
     for key, g in card_stats.items():
         c = cards.get(base_key(key), {})
         card_rows.append({"key": key, "name": c.get("Name", key), "cost": c.get("ManaCost"), "type": c.get("Type"),
-                          "rarity": c.get("Rarity"), **g, "winrate": g["wins"] / g["games"]})
+                          "rarity": c.get("Rarity"), **g, "winrate": g["wins"] / g["games"],
+                          **played_cols(played.get(key))})
     card_rows.sort(key=lambda c: (-c["games"], -c["winrate"], c["name"]))
 
     opp_card_stats = {}
@@ -419,7 +569,8 @@ def compute_stats(conn, build=None):
             g = opp_card_stats.setdefault(key, {"games": 0, "losses": 0})
             g["games"] += 1
             g["losses"] += r["result"] == "L"
-    opp_rows = sorted(({"key": k, "name": name(k), **g, "lossrate": g["losses"] / g["games"]}
+    opp_rows = sorted(({"key": k, "name": name(k), **g, "lossrate": g["losses"] / g["games"],
+                        **played_cols(opp_played.get(k), lose=True)}
                        for k, g in opp_card_stats.items()), key=lambda c: (-c["games"], -c["lossrate"]))
 
     def opp_type(r):
@@ -467,6 +618,7 @@ def compute_stats(conn, build=None):
         "by_opp_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["opp_commander"])],
         "by_opp_rank": group(lambda r: r["opp_rank"]),
         "by_opp_type": group(opp_type),
+        "by_deck": deck_rows,
         "cards": card_rows,
         "opp_cards": opp_rows,
         "onboarding": onboarding_record(),
@@ -483,6 +635,9 @@ def cmd_stats(build=None):
     print(f"matches{scope}: {s['total']} ({s['labeled']} labeled, {s['unlabeled']} need a W/L)")
     if s["winrate"] is not None:
         print(f"record: {s['wins']}-{s['losses']}  win rate {s['winrate']:.0%}")
+    if s["by_opp_type"]:
+        print("vs " + ", vs ".join(f"{g['key'].lower()}s {g['wins']}-{g['games'] - g['wins']} ({g['winrate']:.0%})"
+                                   for g in s["by_opp_type"]))
     if s["current_rank"]:
         print(f"rank: {s['current_rank']}  (" +
               ", ".join(f"{h['rank']} on {h['build']} from {h['since'][:10]}" for h in s["rank_history"]) + ")")
@@ -490,14 +645,21 @@ def cmd_stats(build=None):
         o = s["onboarding"]
         print(f"onboarding bot matches (from game cache): {o['wins']}-{o['losses']} "
               f"({o['wins'] / (o['wins'] + o['losses']):.0%})")
+    if s["by_deck"]:
+        print("\nby deck")
+        for d in s["by_deck"]:
+            wr = f"{d['winrate']:.0%}" if d["winrate"] is not None else "-"
+            print(f"  {d['name']:<24} {d['wins']}-{d['losses']}  {wr:>4}   "
+                  f"vs humans {d['human_w']}-{d['human_l']}, vs bots {d['bot_w']}-{d['bot_l']}")
     if s["by_my_commander"]:
         print("\nby my commander")
         for g in s["by_my_commander"]:
             print(f"  {g['name']:<24} {g['wins']}-{g['games'] - g['wins']}  {g['winrate']:.0%}")
     if s["cards"]:
-        print("\nmy cards (win rate when in deck)")
+        print("\nmy cards                        in deck          when played")
         for c in s["cards"]:
-            print(f"  {c['name']:<28} {c['games']:>3} games  {c['winrate']:.0%}")
+            pw = f"{c['played_games']:>3} games {c['played_winrate']:>4.0%}  avg turn {c['avg_turn']:.1f}" if c["played_games"] else "  never played"
+            print(f"  {c['name']:<28} {c['games']:>3} games {c['winrate']:>4.0%}   {pw}")
     if s["matches"]:
         print("\nrecent matches")
         for m in s["matches"][:15]:

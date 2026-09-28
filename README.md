@@ -61,6 +61,17 @@ The one indirect check is the ladder. Each header carries your rank at match
 start, so the next match on the same build shows what the previous one did to it;
 the dashboard's "Rank after" column surfaces that, and a rise confirms a win.
 
-Cards inside round events are referenced by a per-match instance id, not a deck
-slot, so "cards played" stats need the id mapping worked out from several
-labeled replays; for now card stats are win rate when the card is in your deck.
+## Card instance ids
+
+Round events refer to cards by a per-match instance id. Each deck card gets two
+consecutive ids in decklist order, except a legendary, which has one copy. Player
+0's ids start at 1 and player 1's at 30; ids past the deck are tokens created
+mid-game. Checked on 25 replays: every placement with no lane maps to a Spell
+under this scheme (0 misses in 124), and no neighbouring scheme manages that.
+
+This gives win rate **when played**, times played, and average turn per card, for
+you and for opponents. Draws are not in the replay: draw order comes from the
+seeded shuffle, so only the mulligan and the cards actually played are recorded.
+
+Decks are named from the deck list the client caches (`items.Deck.*`), matched on
+the 13 cards, so the "By deck" table uses the names you gave them in game.

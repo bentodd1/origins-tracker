@@ -10,7 +10,8 @@
   header h1 { margin:0; font-size:18px; letter-spacing:.02em; white-space:nowrap; }
   header .sub { color:var(--muted); white-space:nowrap; }
   main { padding:20px 24px; display:grid; gap:20px; grid-template-columns: 1fr 1fr; }
-  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; min-width:0; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; padding:14px; } }
   section.wide { grid-column: 1 / -1; }
   h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
   .tiles { display:flex; gap:14px; flex-wrap:wrap; }
@@ -45,8 +46,12 @@
     <h2>Matches <span style="font-weight:400;text-transform:none;letter-spacing:0">— click W or L after each game; the replay does not record the winner. "Rank after" is your rank at the start of the next match: a rise confirms a win.</span></h2>
     <div class="wrap"><table id="matches"></table></div>
   </section>
+  <section class="wide">
+    <h2>By deck</h2>
+    <div class="wrap"><table id="decks"></table></div>
+  </section>
   <section>
-    <h2>My cards — win rate when in deck</h2>
+    <h2>My cards — in deck vs when played <span style="font-weight:400;text-transform:none;letter-spacing:0">(draws are not in the replay; plays are)</span></h2>
     <div class="wrap"><table id="cards"></table></div>
   </section>
   <section>
@@ -100,6 +105,8 @@ async function load() {
     ['Win rate', pct(s.winrate)], ['Record', `${s.wins}-${s.losses}`], ['Tracked', s.total],
     ['My rank', s.current_rank || '—'],
   ];
+  const rec = t => { const g = s.by_opp_type.find(x => x.key === t); return g ? `${g.wins}-${g.games - g.wins} (${pct(g.winrate)})` : '—'; };
+  tiles.push(['vs Humans', rec('Human')], ['vs Bots', rec('Bot')]);
   if (s.onboarding) tiles.push(['Onboarding bots', `${s.onboarding.wins}-${s.onboarding.losses} (${pct(s.onboarding.wins/(s.onboarding.wins+s.onboarding.losses))})`]);
   document.getElementById('tiles').innerHTML = tiles.map(([l,v]) => `<div class="tile"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join('');
 
@@ -126,11 +133,20 @@ async function load() {
       list.map(r => '<tr>' + cols.map(c => `<td class="${c.num?'num':''}">${c.f(r)}</td>`).join('') + '</tr>').join('');
   };
   const rate = r => `<span class="bar" style="width:${Math.round((r)*60)}px"></span> ${pct(r)}`;
+  rows('decks', s.by_deck, [
+    {h:'Deck', f:r=>`<b>${esc(r.name)}</b>`}, {h:'Commander', f:r=>esc(r.commander)},
+    {h:'Record', num:true, f:r=>`${r.wins}-${r.losses}`}, {h:'Win rate', f:r=>r.winrate==null?'—':rate(r.winrate)},
+    {h:'vs Humans', num:true, f:r=>`${r.human_w}-${r.human_l}`}, {h:'vs Bots', num:true, f:r=>`${r.bot_w}-${r.bot_l}`},
+    {h:'Last played', f:r=>esc((r.last||'').slice(0,16))},
+    {h:'Cards', f:r=>`<span class="deck">${r.cards.map(esc).join(', ')}</span>`}]);
   rows('cards', s.cards, [
     {h:'Card', f:r=>esc(r.name)}, {h:'Cost', num:true, f:r=>r.cost ?? ''}, {h:'Type', f:r=>esc(r.type||'')},
-    {h:'Games', num:true, f:r=>r.games}, {h:'W', num:true, f:r=>r.wins}, {h:'Win rate', f:r=>rate(r.winrate)}]);
+    {h:'In deck', num:true, f:r=>r.games}, {h:'Win rate', f:r=>rate(r.winrate)},
+    {h:'Played in', num:true, f:r=>r.played_games}, {h:'Win rate when played', f:r=>r.played_winrate==null?'<span class="deck">never played</span>':rate(r.played_winrate)},
+    {h:'Avg turn', num:true, f:r=>r.avg_turn==null?'':r.avg_turn.toFixed(1)}]);
   rows('oppcards', s.opp_cards, [
-    {h:'Card', f:r=>esc(r.name)}, {h:'Games', num:true, f:r=>r.games}, {h:'Losses', num:true, f:r=>r.losses}, {h:'Loss rate', f:r=>rate(r.lossrate)}]);
+    {h:'Card', f:r=>esc(r.name)}, {h:'In their deck', num:true, f:r=>r.games}, {h:'Loss rate', f:r=>rate(r.lossrate)},
+    {h:'Played in', num:true, f:r=>r.played_games}, {h:'Loss rate when played', f:r=>r.played_winrate==null?'<span class="deck">never played</span>':rate(r.played_winrate)}]);
   rows('rank', s.rank_history.slice().reverse(), [
     {h:'Build', f:r=>esc(r.build)}, {h:'Rank', f:r=>esc(r.rank)}, {h:'Since', f:r=>esc(r.since)}]);
   document.getElementById('bybuild-section').hidden = build !== 'all';
