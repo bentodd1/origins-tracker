@@ -15,7 +15,8 @@
   section.wide { grid-column: 1 / -1; }
   h2 { margin:0 0 10px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
   .tiles { display:flex; gap:14px; flex-wrap:wrap; }
-  .tile { min-width:130px; }
+  .tile { min-width:105px; }
+  @media (max-width: 500px) { .tile .v { font-size:22px; } }
   .tile .v { font-size:30px; font-weight:600; }
   .tile .l { color:var(--muted); font-size:12px; }
   table { width:100%; border-collapse:collapse; }
