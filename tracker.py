@@ -10,7 +10,7 @@ Commands:
   python3 tracker.py import          # ingest whatever replay is in the game dir right now
   python3 tracker.py watch           # keep running; ingest each new replay as it appears
   python3 tracker.py label W|L [id]  # mark the latest (or given) match as a win or loss
-  python3 tracker.py stats [build]   # print win rate and card stats (optionally for Demo / Playtest only)
+  python3 tracker.py stats [build] [human|bot]   # win rate and card stats, optionally narrowed
   python3 tracker.py serve [port]    # local dashboard (default http://localhost:8787)
 """
 import errno
@@ -470,13 +470,25 @@ def onboarding_record():
     return None
 
 
-def compute_stats(conn, build=None):
-    """Stats for all matches, or only those from one build (Demo / Playtest / ...)."""
+def opponent_type(r):
+    """Bot / Human / ? for a match row. Player field 2 is the game's own is-bot flag
+    (a bot's id is also the literal "Bot"); the cursor count is a fallback for rows
+    imported before the flag was understood."""
+    if r["opp_flag2"]:
+        return "Bot"
+    n = r["opp_cursor_points"]
+    return "?" if n is None else ("Bot" if n == 0 else "Human")
+
+
+def compute_stats(conn, build=None, opp=None):
+    """Stats for all matches, optionally narrowed to one build (Demo / Playtest / ...)
+    and to one kind of opponent (Human / Bot)."""
     cards, _ = load_card_db()
     all_rows = conn.execute("SELECT * FROM matches ORDER BY played_at").fetchall()
     builds = sorted({r["build"] or "?" for r in all_rows})
     latest_build = (all_rows[-1]["build"] or "?") if all_rows else None
-    rows = [r for r in all_rows if not build or (r["build"] or "?") == build]
+    rows_build = [r for r in all_rows if not build or (r["build"] or "?") == build]
+    rows = [r for r in rows_build if not opp or opponent_type(r) == opp]
     labeled = [r for r in rows if r["result"]]
     wins = sum(1 for r in labeled if r["result"] == "W")
 
@@ -484,9 +496,9 @@ def compute_stats(conn, build=None):
         c = cards.get(base_key(key or ""))
         return c["Name"] if c else key
 
-    def group(keyfn):
+    def group(keyfn, source=None):
         out = {}
-        for r in labeled:
+        for r in (labeled if source is None else source):
             k = keyfn(r)
             g = out.setdefault(k, {"games": 0, "wins": 0})
             g["games"] += 1
@@ -585,7 +597,7 @@ def compute_stats(conn, build=None):
     # rank as recorded in each replay, tracked per build since each build has its
     # own ladder; a new entry each time it changes
     rank_history, last_by_build = [], {}
-    for r in rows:
+    for r in rows_build:   # the ladder does not care who the opponent was
         b = r["build"] or "?"
         if r["my_rank"] and last_by_build.get(b) != r["my_rank"]:
             rank_history.append({"build": b, "rank": r["my_rank"], "since": r["played_at"]})
@@ -617,7 +629,8 @@ def compute_stats(conn, build=None):
         "by_my_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["my_commander"])],
         "by_opp_commander": [{**g, "name": name(g["key"])} for g in group(lambda r: r["opp_commander"])],
         "by_opp_rank": group(lambda r: r["opp_rank"]),
-        "by_opp_type": group(opp_type),
+        "opp": opp,
+        "by_opp_type": group(opp_type, [r for r in rows_build if r["result"]]),
         "by_deck": deck_rows,
         "cards": card_rows,
         "opp_cards": opp_rows,
@@ -629,9 +642,9 @@ def compute_stats(conn, build=None):
     }
 
 
-def cmd_stats(build=None):
-    s = compute_stats(db(), build)
-    scope = f" [{build}]" if build else ""
+def cmd_stats(build=None, opp=None):
+    s = compute_stats(db(), build, opp)
+    scope = (f" [{build}]" if build else "") + (f" [vs {opp.lower()}s]" if opp else "")
     print(f"matches{scope}: {s['total']} ({s['labeled']} labeled, {s['unlabeled']} need a W/L)")
     if s["winrate"] is not None:
         print(f"record: {s['wins']}-{s['losses']}  win rate {s['winrate']:.0%}")
@@ -693,8 +706,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, dashboard_html(), "text/html")
         if u.path == "/api/stats":
             conn = db()
-            build = parse_qs(u.query).get("build", [None])[0] or None
-            return self._send(200, json.dumps(compute_stats(conn, build), default=str))
+            q = parse_qs(u.query)
+            build = q.get("build", [None])[0] or None
+            opp = q.get("opp", [None])[0] or None
+            return self._send(200, json.dumps(compute_stats(conn, build, opp if opp in ("Human", "Bot") else None), default=str))
         self._send(404, "{}")
 
     def do_POST(self):
@@ -736,7 +751,11 @@ if __name__ == "__main__":
     elif cmd == "label":
         cmd_label(args[1], args[2] if len(args) > 2 else None)
     elif cmd == "stats":
-        cmd_stats(args[1] if len(args) > 1 else None)
+        # stats [build] [human|bot], in either order
+        opts = [a for a in args[1:]]
+        opp = next((a.capitalize() for a in opts if a.lower() in ("human", "bot")), None)
+        bld = next((a for a in opts if a.lower() not in ("human", "bot")), None)
+        cmd_stats(bld, opp)
     elif cmd == "serve":
         cmd_serve(int(args[1]) if len(args) > 1 else 8787)
     else:

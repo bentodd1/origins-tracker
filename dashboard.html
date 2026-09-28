@@ -37,7 +37,7 @@
 </style>
 </head>
 <body>
-<header><h1>Origins Tracker</h1><span class="sub" id="sub">loading…</span><nav class="tabs" id="tabs"></nav></header>
+<header><h1>Origins Tracker</h1><span class="sub" id="sub">loading…</span><nav class="tabs" id="tabs"></nav><nav class="tabs" id="opptabs" style="margin-left:0"></nav></header>
 <main>
   <section class="wide">
     <h2>Record</h2>
@@ -95,12 +95,24 @@ function setBuild(b) {
   try { localStorage.setItem('origins.build', b); } catch (e) {}
   load();
 }
+let opp = 'all';
+try { opp = localStorage.getItem('origins.opp') || 'all'; } catch (e) {}
+function setOpp(o) {
+  opp = o;
+  try { localStorage.setItem('origins.opp', o); } catch (e) {}
+  load();
+}
 async function load() {
-  const q = build && build !== 'all' ? `?build=${encodeURIComponent(build)}` : '';
+  const params = new URLSearchParams();
+  if (build && build !== 'all') params.set('build', build);
+  if (opp !== 'all') params.set('opp', opp);
+  const q = params.toString() ? '?' + params.toString() : '';
   const s = await (await fetch('/api/stats' + q)).json();
   if (!build) { build = s.latest_build || 'all'; if (build !== 'all') return load(); }
   document.getElementById('tabs').innerHTML = ['all', ...s.builds].map(b =>
     `<button class="${b===build?'on':''}" onclick="setBuild('${esc(b)}')">${b==='all'?'All builds':esc(b)}</button>`).join('');
+  document.getElementById('opptabs').innerHTML = [['all','All opponents'],['Human','Humans'],['Bot','Bots']].map(([v,l]) =>
+    `<button class="${v===opp?'on':''}" onclick="setOpp('${v}')">${l}</button>`).join('');
   document.getElementById('sub').textContent = `${s.total} match${s.total===1?'':'es'} tracked · ${s.unlabeled} waiting for a W/L`;
   const tiles = [
     ['Win rate', pct(s.winrate)], ['Record', `${s.wins}-${s.losses}`], ['Tracked', s.total],
