@@ -282,7 +282,7 @@ def db():
     c.executescript(SCHEMA)
     cols = {r["name"] for r in c.execute("PRAGMA table_info(matches)")}
     for col, typ in (("build", "TEXT"), ("my_cursor_points", "INTEGER"), ("opp_cursor_points", "INTEGER"),
-                     ("result_source", "TEXT"), ("my_index", "INTEGER")):
+                     ("result_source", "TEXT"), ("my_index", "INTEGER"), ("screen_lines", "TEXT")):
         if col not in cols:
             c.execute(f"ALTER TABLE matches ADD COLUMN {col} {typ}")
     if "card_key" not in {r["name"] for r in c.execute("PRAGMA table_info(placements)")}:
@@ -322,6 +322,13 @@ def ingest(path, conn=None):
          None, datetime.now().isoformat(sep=" "), rec["build"], me["cursor_points"], opp.get("cursor_points")))
     conn.execute("UPDATE matches SET my_index=? WHERE id=?", (rec["my_index"], rec["file"]))
     insert_placements(conn, rec)
+    # a screen-only record of the same match (banner seen before/after the file landed)
+    twin = conn.execute("SELECT id, result, screen_lines FROM matches WHERE id LIKE 'screen_%' AND result IS NOT NULL "
+                        "AND abs(strftime('%s', played_at) - strftime('%s', ?)) < 90", (rec["played_at"],)).fetchone()
+    if twin:
+        conn.execute("UPDATE matches SET result=?, result_source='screen', screen_lines=? WHERE id=? AND result IS NULL",
+                     (twin["result"], twin["screen_lines"], rec["file"]))
+        conn.execute("DELETE FROM matches WHERE id=?", (twin["id"],))
     conn.commit()
     return rec
 
@@ -339,10 +346,14 @@ OCR_SRC = os.path.join(HERE, "ocr.swift")
 DEBUG_DIR = os.path.join(DATA_DIR, "debug")
 
 
+OCR_WIDTH = 1400   # captures are shrunk to this before OCR: the banner is huge, and it keeps polling cheap
+
+
 def ocr_screen(keep_as=None):
-    """Text lines currently visible on the main display (macOS only, needs Screen
-    Recording permission for the terminal). Returns [] if anything fails.
-    keep_as: if set, the capture and the lines read are kept under data/debug/
+    """Text on the main display as [(text, height)], height being the text's
+    height as a fraction of the screen (macOS only; needs Screen Recording
+    permission for the terminal). Returns [] if anything fails.
+    keep_as: if set, the capture and the text read are kept under data/debug/
     with that name so a failed read can be inspected. Never committed."""
     if sys.platform != "darwin":
         return []
@@ -354,14 +365,21 @@ def ocr_screen(keep_as=None):
         shot = f.name
     try:
         subprocess.run(["screencapture", "-x", shot], capture_output=True, timeout=10)
+        subprocess.run(["sips", "-Z", str(OCR_WIDTH), shot], capture_output=True, timeout=10)
         out = subprocess.run([OCR_BIN, shot], capture_output=True, text=True, timeout=30).stdout
-        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        lines = []
+        for ln in out.splitlines():
+            h, _, text = ln.partition("\t")
+            if text.strip():
+                try:
+                    lines.append((text.strip(), float(h)))
+                except ValueError:
+                    lines.append((ln.strip(), 0.0))
         if keep_as:
             os.makedirs(DEBUG_DIR, exist_ok=True)
-            subprocess.run(["sips", "-Z", "1600", shot, "--out", os.path.join(DEBUG_DIR, keep_as + ".png")],
-                           capture_output=True)
+            shutil.copy(shot, os.path.join(DEBUG_DIR, keep_as + ".png"))
             with open(os.path.join(DEBUG_DIR, keep_as + ".txt"), "w") as fh:
-                fh.write("\n".join(lines))
+                fh.write("\n".join(f"{h:.3f}  {t}" for t, h in lines))
         return lines
     except Exception:
         return []
@@ -372,21 +390,139 @@ def ocr_screen(keep_as=None):
             pass
 
 
+BANNER_MIN_HEIGHT = 0.035   # the results banner is far taller than any menu or chat text
+
+
 def result_on_screen(lines):
-    """W/L if the results screen banner is among the OCR lines, else None.
-    Whole-line match only: "Victory Points" is on the screen after a loss too."""
-    for ln in lines:
-        w = re.sub(r"[^a-z]", "", ln.lower())
-        if w == "victory":
+    """W/L if the results-screen banner is among the OCR lines, else None.
+    Whole-line match only ("Victory Points" is on the screen after a loss too),
+    and the word has to be banner-sized so text in some other window never counts."""
+    for item in lines:
+        text, h = item if isinstance(item, tuple) else (item, 1.0)
+        w = re.sub(r"[^a-z]", "", text.lower())
+        if h >= BANNER_MIN_HEIGHT and w == "victory":
             return "W"
-        if w == "defeat":
+        if h >= BANNER_MIN_HEIGHT and w == "defeat":
             return "L"
     return None
+
+
+def game_running():
+    if sys.platform != "darwin":
+        return True
+    r = subprocess.run(["pgrep", "-f", "MacOS/Origins TCG"], capture_output=True)
+    return r.returncode == 0
+
+
+WATCH_BIN = os.path.join(HERE, "screenwatch")
+WATCH_SRC = os.path.join(HERE, "screenwatch.swift")
+SCREEN = {"banner": None, "banner_at": 0.0, "lines": [], "frames": 0}   # shared with auto_label
+
+
+def screen_frames(interval=2.0):
+    """Yield (time, [(text, height)]) frames from the long-running screen reader."""
+    if not os.path.exists(WATCH_BIN) and os.path.exists(WATCH_SRC):
+        subprocess.run(["swiftc", "-O", WATCH_SRC, "-o", WATCH_BIN], capture_output=True)
+    if not os.path.exists(WATCH_BIN):
+        return
+    proc = subprocess.Popen([WATCH_BIN, str(interval), str(OCR_WIDTH)], stdout=subprocess.PIPE, text=True)
+    try:
+        cur, t = [], 0
+        for ln in proc.stdout:
+            ln = ln.rstrip("\n")
+            if ln.startswith("FRAME"):
+                cur, t = [], int(ln.split()[1] or 0)
+            elif ln == "END":
+                yield t, cur
+                if not game_running():
+                    return          # stop reading the screen while the game is closed
+            else:
+                h, _, text = ln.partition("\t")
+                try:
+                    cur.append((text, float(h)))
+                except ValueError:
+                    pass
+    finally:
+        proc.kill()
+
+
+def screen_poll_loop(interval=2.0, idle_interval=10.0, quiet=False):
+    """For builds that no longer write a replay file: watch the screen for the
+    Victory/Defeat banner and record a match from that alone. Runs forever; the
+    screen reader only runs while the game does. Every line of text seen in the
+    20 s after the banner is stored with the match, so opponent name and rank
+    change can be mined from it later."""
+    if not quiet:
+        print("screen watch on: matches are recorded from the results screen when no replay file appears")
+    while True:
+        if not game_running():
+            time.sleep(idle_interval)
+            continue
+        collecting = None    # (result, started, lines) while gathering the results screen
+        for t, lines in screen_frames(interval):
+            SCREEN["frames"] += 1
+            res = result_on_screen(lines)
+            if collecting:
+                collecting[2].extend(text for text, _ in lines)
+                if time.time() - collecting[1] > 20:
+                    record_screen_match(collecting[0], collecting[2])
+                    collecting = None
+                continue
+            if res and time.time() - SCREEN["banner_at"] > 90:
+                SCREEN.update(banner=res, banner_at=time.time(), lines=[text for text, _ in lines])
+                collecting = (res, time.time(), [text for text, _ in lines])
+        time.sleep(idle_interval)
+
+
+def record_screen_match(res, lines):
+    """A match known only from its results screen. Merged into the replay's row
+    if one arrives within 90 s (see ingest)."""
+    conn = db()
+    now = datetime.now()
+    mid = f"screen_{now:%Y-%m-%d_%H-%M-%S}"
+    builds = [detect_build(p) for p in game_replays()] or [None]
+    uniq = []
+    for ln in lines:
+        if ln not in uniq:
+            uniq.append(ln)
+    conn.execute(
+        "INSERT INTO matches (id, played_at, me, opp, my_deck, opp_deck, rounds, result, result_source, imported_at, build, screen_lines) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (mid, now.isoformat(sep=" ")[:19], None, None, "[]", "[]", None, res, "screen", now.isoformat(sep=" "),
+         builds[0] or current_build_guess(), json.dumps(uniq)))
+    conn.commit()
+    print(f"[{now:%H:%M:%S}] results screen: {res} (no replay file; recorded from the screen)")
+    return mid
+
+
+def current_build_guess():
+    """Which build is running, from its log being the newest one."""
+    logs = glob.glob(os.path.expanduser("~/Library/Logs/Koin Games/*/Player.log"))
+    if not logs:
+        return None
+    newest = max(logs, key=os.path.getmtime)
+    return os.path.basename(os.path.dirname(newest)).replace("Origins TCG", "").strip() or "Release"
 
 
 def auto_label(match_id, attempts=12, interval=2.0):
     """Try for about half a minute to read the results screen and label the match.
     The first, middle and last captures of a failed run are kept for inspection."""
+    if db().execute("SELECT 1 FROM matches WHERE id=? AND result IS NOT NULL", (match_id,)).fetchone():
+        return None   # already labeled (e.g. merged from the screen poller)
+    if SCREEN["frames"]:
+        # the screen poller is running: wait for it to see the banner (or to have seen it just before the file landed)
+        deadline = time.time() + attempts * interval
+        while time.time() < deadline:
+            if abs(SCREEN["banner_at"] - time.time()) < 120 and SCREEN["banner"]:
+                conn = db()
+                conn.execute("UPDATE matches SET result=?, result_source='screen', screen_lines=? WHERE id=? AND result IS NULL",
+                             (SCREEN["banner"], json.dumps(SCREEN["lines"]), match_id))
+                conn.commit()
+                print(f"[{datetime.now():%H:%M:%S}] results screen read: {SCREEN['banner']}")
+                return SCREEN["banner"]
+            time.sleep(1.0)
+        print(f"[{datetime.now():%H:%M:%S}] could not read the results screen; mark it W/L in the dashboard")
+        return None
     shutil.rmtree(DEBUG_DIR, ignore_errors=True)   # captures from the previous run
     for i in range(attempts):
         keep = f"attempt{i:02d}" if i in (0, attempts // 2, attempts - 1) else None
@@ -500,6 +636,8 @@ def compute_stats(conn, build=None, opp=None):
         out = {}
         for r in (labeled if source is None else source):
             k = keyfn(r)
+            if k is None:
+                continue
             g = out.setdefault(k, {"games": 0, "wins": 0})
             g["games"] += 1
             g["wins"] += r["result"] == "W"
@@ -510,7 +648,9 @@ def compute_stats(conn, build=None, opp=None):
     named = load_named_decks()
     deck_stats = {}
     for r in rows:
-        deck_cards = json.loads(r["my_deck"])
+        deck_cards = json.loads(r["my_deck"] or "[]")
+        if not deck_cards:
+            continue          # known from the results screen only
         k = (r["my_commander"], tuple(sorted(deck_cards)))
         d = deck_stats.setdefault(k, {"games": 0, "wins": 0, "losses": 0, "unlabeled": 0,
                                       "human_w": 0, "human_l": 0, "bot_w": 0, "bot_l": 0,
@@ -735,6 +875,8 @@ def cmd_serve(port=8787):
         raise
     print(f"dashboard: http://localhost:{port}")
     threading.Thread(target=cmd_watch, kwargs={"quiet": True}, daemon=True).start()
+    if sys.platform == "darwin":
+        threading.Thread(target=screen_poll_loop, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
