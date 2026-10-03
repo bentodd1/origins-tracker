@@ -474,6 +474,16 @@ def screen_poll_loop(interval=2.0, idle_interval=10.0, quiet=False):
         time.sleep(idle_interval)
 
 
+def opponent_from_screen(lines):
+    """The results screen shows '<me>  VS  <opponent>'; the opponent is the line after VS."""
+    for i, ln in enumerate(lines[:-1]):
+        if re.sub(r"[^a-z]", "", ln.lower()) == "vs":
+            nxt = lines[i + 1].strip()
+            if nxt and not re.fullmatch(r"(?i)victory!?|defeat!?|next|view board|home", nxt):
+                return nxt.title() if nxt.isupper() else nxt
+    return None
+
+
 def record_screen_match(res, lines):
     """A match known only from its results screen. Merged into the replay's row
     if one arrives within 90 s (see ingest)."""
@@ -485,13 +495,14 @@ def record_screen_match(res, lines):
     for ln in lines:
         if ln not in uniq:
             uniq.append(ln)
+    opp = opponent_from_screen(uniq)
     conn.execute(
         "INSERT INTO matches (id, played_at, me, opp, my_deck, opp_deck, rounds, result, result_source, imported_at, build, screen_lines) "
         "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (mid, now.isoformat(sep=" ")[:19], None, None, "[]", "[]", None, res, "screen", now.isoformat(sep=" "),
+        (mid, now.isoformat(sep=" ")[:19], None, opp, "[]", "[]", None, res, "screen", now.isoformat(sep=" "),
          builds[0] or current_build_guess(), json.dumps(uniq)))
     conn.commit()
-    print(f"[{now:%H:%M:%S}] results screen: {res} (no replay file; recorded from the screen)")
+    print(f"[{now:%H:%M:%S}] results screen: {res} vs {opp or '?'} (no replay file; recorded from the screen)")
     return mid
 
 

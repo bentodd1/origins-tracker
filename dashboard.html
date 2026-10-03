@@ -134,7 +134,7 @@ async function load() {
       <td>${esc(m.my_rank)}</td>
       <td class="${m.rank_after && m.rank_after !== m.my_rank ? 'W' : ''}">${m.rank_after ? (m.rank_after === m.my_rank ? '=' : esc(m.rank_after)) : '<span class="deck">next match</span>'}</td>
       <td>${esc(m.my_commander_name)}</td>
-      <td>${m.opp ? `${esc(m.opp_commander_name)} <span class="deck">(${esc(m.opp)})</span>` : '<span class="deck">screen only — no replay file</span>'}</td>
+      <td>${m.id.startsWith('screen_') ? `${esc(m.opp || '?')} <span class="deck">(from screen)</span>` : `${esc(m.opp_commander_name)} <span class="deck">(${esc(m.opp)})</span>`}</td>
       <td>${esc(m.opp_rank)}</td><td>${esc(m.opp_type)}</td><td class="num">${m.rounds}</td>
       <td class="deck">${m.my_deck_names.map(esc).join(', ')}</td>
       <td class="deck">${m.opp_deck_names.map(esc).join(', ')}</td></tr>`).join('') +
