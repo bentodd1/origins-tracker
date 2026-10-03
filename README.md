@@ -32,6 +32,21 @@ ORIGINS_GAME_DIR="/path/to/folder" python3 tracker.py serve
 
 Match history is stored in `data/` next to the script and is not committed.
 
+### Keep it running (macOS)
+
+The tracker only records matches while it is running. To have it start at login
+and restart if it ever dies, install the launch agent (edit nothing; the install
+fills in the path):
+
+```
+sed "s|__HERE__|$(pwd)|g" com.origins-tracker.plist > ~/Library/LaunchAgents/com.origins-tracker.plist
+launchctl load ~/Library/LaunchAgents/com.origins-tracker.plist
+```
+
+Logs go to `data/tracker.log`. To stop it: `launchctl unload ~/Library/LaunchAgents/com.origins-tracker.plist`.
+Screen Recording permission then belongs to whatever launched it (launchd), so
+macOS will ask once more the first time it captures.
+
 ## What the replay contains
 
 `replay_format.py` decodes the game's field-tagged binary. Per match: arena, seed,
